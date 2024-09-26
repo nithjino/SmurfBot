@@ -7,5 +7,12 @@ pipeline {
                 sh 'sleep 10s'
             }
         }
+
+        stage('Create Docker Image') {
+            steps {
+                echo "create docker image"
+                sh 'sleep 10s'
+            }
+        }
     }
 }
