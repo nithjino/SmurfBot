@@ -1,5 +1,5 @@
 pipeline {
-    agent {label "default" }
+    agent { label "default" }
     stages {
         stage('Install Depedencies') {
             steps {
