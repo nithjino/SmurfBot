@@ -1,5 +1,8 @@
 pipeline {
     agent { label "default" }
+
+    triggers { pollSCM '*/5 * * * *' }
+
     stages {
         stage('Install Depedencies') {
             steps {
