@@ -7,36 +7,28 @@ import argparse
 import configparser
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import discord
-from pydantic import BaseModel
 
+from constants import BOT_PATH, DELIM, MIN_REMIND_ARGUMENTS
+from models import CommandParameters
 from remind import Remind
 from tags import Tags
-from utilities import Utilities
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
 _logger = logging.getLogger(__name__)
 client = discord.Client(intents=discord.Intents.all())
-BOT_PATH = Path(__file__).resolve().parent
-DELIM = "$"
-MIN_REMIND_ARGUMENTS = 2
 
 
-class CommandParameters(BaseModel):
-    """Command context passed to bot command handlers."""
-
-    command: str
-    message: list[str]
-    attachment: str | None = None
-    fetch_user_func: Any = None
-    created_at: Any
-    author_id: int
-    guild_id: int | None
-    channel_id: int
+async def post_help(_parameters: CommandParameters | None = None) -> str:
+    """:return: a string containing what commands the bot has"""
+    return (
+        "The commands are: tag, git, and remind. "
+        "Each one has their own help command except for git."
+    )
 
 
 tags: dict[int, Tags] = {}
@@ -86,16 +78,34 @@ async def parse_remind_commands(parameters: CommandParameters) -> str:
     return await r.create_reminder(time, message, user, created_at, fetch_user_func, guild_id, channel_id)
 
 
-async def mock(parameters: CommandParameters) -> str:
+async def mock(parameters: CommandParameters | str) -> str:
     """Return the supplied message in mocking text format."""
     _logger.info("mock parameters: %s", parameters)
-    message = " ".join(parameters.message)
-    return await Utilities.mock(message)
+    if isinstance(parameters, str):
+        message = parameters.lower().strip()
+    else:
+        message = " ".join(parameters.message).lower().strip()
+
+    result = ""
+    for index, character in enumerate(message):
+        if character.isspace():
+            result = result + " "
+            continue
+
+        previous_character_is_upper = (
+            index > 0 and result[-2].isupper()
+            if message[index - 1].isspace()
+            else index > 0 and result[-1].isupper()
+        )
+        result += character if previous_character_is_upper else character.upper()
+
+    return result
 
 
-async def git(_parameters: CommandParameters) -> str:
-    """Return the source repository link."""
-    return await Utilities.git()
+async def git(_parameters: CommandParameters | None = None) -> str:
+    """:return: a url of the git repo of the source code"""
+    git_url = "https://github.com/nithjino/SmurfBot"
+    return f"Here is the source code: {git_url}"
 
 
 valid_commands: dict[str, Callable[[CommandParameters], Awaitable[str]]] = {
@@ -104,6 +114,7 @@ valid_commands: dict[str, Callable[[CommandParameters], Awaitable[str]]] = {
     "git": git,
     "mock": mock,
     "remind": parse_remind_commands,
+    "help": post_help
 }
 
 
@@ -133,9 +144,10 @@ async def on_message(message: discord.Message) -> None:
     if message.content.startswith(DELIM):
         command_parts = message.content[1:].split(" ")
         _logger.info("command: %s", command_parts)
-        if command_parts[0] in valid_commands:
+        user_command = command_parts[0]
+        if user_command in valid_commands:
             parameters = CommandParameters(
-                command=command_parts[0],
+                command=user_command,
                 message=command_parts[1:],
                 created_at=message.created_at,
                 author_id=message.author.id,
@@ -150,9 +162,14 @@ async def on_message(message: discord.Message) -> None:
             if parameters.command == "remind" or is_owner_lookup:
                 parameters.fetch_user_func = client.fetch_user
 
-            command = command_parts[0]
-            result = await valid_commands[command](parameters)
+            result = await valid_commands[user_command](parameters)
             await message.channel.send(result)
+        else:
+            invalid_command_message = (
+                f"{user_command} is not a valid command. "
+                f"Here are the commands {await post_help()}"
+            )
+            await message.channel.send(invalid_command_message)
 
 
 def configure_logging() -> None:

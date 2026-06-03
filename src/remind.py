@@ -12,45 +12,14 @@ from typing import TYPE_CHECKING
 import discord
 import pytz
 from atomicwrites import atomic_write
-from pydantic import BaseModel, Field
+
+from constants import DATE_FORMAT, DURATION_UNIT_SECONDS, HUMAN_DATE_FORMAT, MAX_REMINDER_SECONDS
+from models import DatetimePassedResult, ReminderFile, ReminderRecord
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
 _logger = logging.getLogger(__name__)
-
-DATE_FORMAT = "%Y-%m-%dT%H:%M:%S"
-HUMAN_DATE_FORMAT = "%m/%d/%Y @ %I:%M%p"
-MAX_REMINDER_SECONDS = 31_557_600
-DURATION_UNIT_SECONDS = {"s": 1, "m": 60, "h": 60 * 60, "d": 60 * 60 * 24}
-
-
-class DatetimePassedResult(BaseModel):
-    """Result of comparing a planned execution time with now."""
-
-    result: bool
-    seconds_until_execution: float
-
-
-class ReminderRecord(BaseModel):
-    """Persisted reminder data."""
-
-    user_id: int
-    name: str
-    message: str
-    created_at: str
-    execution_time: str | datetime
-    timezone: str
-    guild_id: int | None
-    channel_id: int
-
-
-class ReminderFile(BaseModel):
-    """Persisted guild reminder file."""
-
-    name: str
-    id: int
-    reminders: list[ReminderRecord] = Field(default_factory=list)
 
 
 def parse_time(time: str) -> int | None:

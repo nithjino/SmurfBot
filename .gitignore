@@ -10,5 +10,5 @@ local.sh
 src/test.py
 *.bak
 .ruff_cache
-.uv_cache
+.uv-cache
 .venv

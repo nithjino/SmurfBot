@@ -6,47 +6,17 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import discord
 from atomicwrites import atomic_write
-from pydantic import BaseModel, Field
+
+from models import TagCommandParameters, TagContent, TagFile, TagRecord
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
 _logger = logging.getLogger(__name__)
-
-
-class TagContent(BaseModel):
-    """Incoming content for a new tag."""
-
-    message: str
-    attachment: str | None
-
-
-class TagRecord(BaseModel):
-    """Persisted tag data."""
-
-    owner: int
-    content: str
-
-
-class TagFile(BaseModel):
-    """Persisted guild tag file."""
-
-    name: str
-    id: int
-    tags: dict[str, TagRecord] = Field(default_factory=dict)
-
-
-class TagCommandParameters(BaseModel):
-    """Command context needed by tag operations."""
-
-    message: list[str]
-    attachment: str | None = None
-    author_id: int
-    fetch_user_func: Any = None
 
 
 class Tags:
