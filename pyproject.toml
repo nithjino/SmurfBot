@@ -1,0 +1,63 @@
+[project]
+name = "smurfbot"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "discord.py==2.1.0",
+    "atomicwrites==1.4.1",
+    "pytz==2022.6",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "mypy>=2.1.0",
+    "ruff>=0.15.15",
+]
+
+[tool.ruff]
+exclude = [
+    ".git",
+    ".git-rewrite",
+    ".venv",
+    ".vscode",
+    ".idea"
+]
+
+line-length = 120
+indent-width = 4
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "BLE001",
+    "COM812",
+    "D203",
+    "D213",
+    "D413",
+    "EXE002",
+    "FIX002",
+    "PLR0913",
+    "TD002",
+    "TD003"
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.mccabe]
+max-complexity = 25
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-line-length = "dynamic"
+
+[tool.pyright]
+include = ["src"]
+typeCheckingMode = "standard"
+pythonVersion = "3.14"

@@ -1,17 +1,15 @@
-FROM python:3.11.0-slim-buster
-RUN useradd --create-home groupme
-RUN rm -f /etc/localtime
-RUN ln -s /usr/share/zoneinfo/America/New_York /etc/localtime
-USER groupme
-WORKDIR /home/groupme
-COPY requirements.txt .
-RUN pip install --user --no-warn-script-location -r requirements.txt
-RUN rm requirements.txt
-RUN mkdir app/
-RUN mkdir app/src/
-RUN mkdir app/logs/
-RUN mkdir app/tags/
-RUN mkdir app/reminders/
+FROM python:3.14.5-alpine3.23
+ENV TZ=America/New_York \
+    PATH="/home/smurfbot/.venv/bin:${PATH}"
+RUN apk add --no-cache tzdata uv \
+    && adduser -h /home/smurfbot -D smurfbot \
+    && cp /usr/share/zoneinfo/${TZ} /etc/localtime \
+    && echo "${TZ}" > /etc/timezone
+USER smurfbot
+WORKDIR /home/smurfbot
+COPY pyproject.toml .
+RUN uv sync --no-dev --no-cache
+RUN mkdir -p app/src app/logs app/tags app/reminders
 COPY src/* app/src/
-WORKDIR /home/groupme/app
+WORKDIR /home/smurfbot/app
 CMD ["python","src/start.py", "-c", "config.ini"]

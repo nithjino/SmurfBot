@@ -1,0 +1,12 @@
+services:
+  smurfbot:
+    build:
+      context: .
+    image: smurfbot:latest
+    container_name: smurfbot
+    restart: unless-stopped
+    init: true
+    volumes:
+      - ./config.ini:/home/smurfbot/app/config.ini:ro
+      - ./tags:/home/smurfbot/app/tags
+      - ./reminders:/home/smurfbot/app/reminders

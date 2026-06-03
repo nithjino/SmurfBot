@@ -1,10 +1,10 @@
 pipeline {
-    agent { label "default" }
+    agent { label "python" }
 
-    triggers { pollSCM '*/5 * * * *' }
+    triggers { pollSCM '*/1 * * * *' }
 
     stages {
-        stage('Install Depedencies') {
+        stage('Install Dependencies') {
             steps {
                 echo "install dependencies"
                 sh 'sleep 10s'
