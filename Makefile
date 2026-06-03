@@ -1,4 +1,4 @@
-.PHONY: install-deps format lint type-check full-check build up up-build down down-rm
+.PHONY: install-deps format lint type-check full-check build up up-detach up-build up-build-detach down down-rm
 
 install-deps:
 	@echo "Installing dependencies..."
@@ -27,9 +27,17 @@ up:
 	@echo "Starting smurfbot..."
 	docker compose up
 
+up-detach:
+	@echo "Starting smurfbot in detached mode..."
+	docker compose up -d
+
 up-build:
 	@echo "Building and starting smurfbot..."
 	docker compose up --build
+
+up-build-detach:
+	@echo "Building and starting smurfbot in detached mode..."
+	docker compose up --build -d
 
 down:
 	@echo "Stopping smurfbot..."
