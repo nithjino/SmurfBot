@@ -32,15 +32,15 @@ discord = your_discord_bot_token
 
 ## Docker
 
-The Compose service mounts `config.ini`, `tags`, and `reminders` from the repo root:
+The Compose service mounts `config.ini`, tag files, and reminder files from the repo:
 
 ```text
 ./config.ini -> /home/smurfbot/app/config.ini
-./tags -> /home/smurfbot/app/tags
-./reminders -> /home/smurfbot/app/reminders
+./src/tags/files -> /home/smurfbot/app/src/tags/files
+./src/reminders/files -> /home/smurfbot/app/src/reminders/files
 ```
 
-Create `config.ini` before starting the container. The `tags` and `reminders` directories keep bot data persistent across container restarts.
+Create `config.ini` before starting the container. The `src/tags/files` and `src/reminders/files` directories keep bot data persistent across container restarts.
 
 You can use the Makefile wrappers:
 
@@ -91,7 +91,7 @@ The bot rejects reminders longer than `31557600` seconds, which is about one yea
 
 ### Reminder JSON structure
 
-Reminder files are stored as `reminders/<guild_id>.json`. The bot creates one reminder file per Discord guild and removes expired reminders when it loads or lists them.
+Reminder files are stored as `src/reminders/files/<guild_id>.json`. The bot creates one reminder file per Discord guild and removes expired reminders when it loads or lists them.
 
 ```json
 {
@@ -152,7 +152,7 @@ The `owner` command returns the owner user ID and attempts to match it to the ow
 
 ### Tag JSON structure
 
-Tag files are stored as `tags/<guild_id>.json`.
+Tag files are stored as `src/tags/files/<guild_id>.json`.
 
 ```json
 {

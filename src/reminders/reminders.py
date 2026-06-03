@@ -14,7 +14,8 @@ import pytz
 from atomicwrites import atomic_write
 
 from constants import DATE_FORMAT, DURATION_UNIT_SECONDS, HUMAN_DATE_FORMAT, MAX_REMINDER_SECONDS
-from models import DatetimePassedResult, ReminderFile, ReminderRecord
+
+from .models import DatetimePassedResult, ReminderFile, ReminderRecord
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -79,7 +80,7 @@ def has_datetime_passed(planned_execution_date: datetime | str) -> DatetimePasse
     return DatetimePassedResult(result=True, seconds_until_execution=-1)
 
 
-class Remind:
+class Reminders:
     """Manage persisted reminders and scheduled reminder messages for a guild."""
 
     def __init__(self, guild: discord.Guild, reminders_json_path: str | Path, client: discord.Client) -> None:

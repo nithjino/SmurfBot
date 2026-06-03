@@ -13,7 +13,7 @@ import discord
 
 from constants import BOT_PATH, DELIM, MIN_REMIND_ARGUMENTS
 from models import CommandParameters
-from remind import Remind
+from reminders import Reminders
 from tags import Tags
 
 if TYPE_CHECKING:
@@ -25,14 +25,11 @@ client = discord.Client(intents=discord.Intents.all())
 
 async def post_help(_parameters: CommandParameters | None = None) -> str:
     """:return: a string containing what commands the bot has"""
-    return (
-        "The commands are: tag, git, and remind. "
-        "Each one has their own help command except for git."
-    )
+    return "The commands are: tag, git, and remind. Each one has their own help command except for git."
 
 
 tags: dict[int, Tags] = {}
-reminds: dict[int, Remind] = {}
+reminders: dict[int, Reminders] = {}
 
 
 async def ping(parameters: CommandParameters) -> str:
@@ -61,8 +58,8 @@ async def parse_remind_commands(parameters: CommandParameters) -> str:
     guild_id = parameters.guild_id
     if guild_id is None or channel_id is None:
         return f"guild_id ({guild_id}) or channel_id {channel_id} is None."
-    # getting the Remind obj for that discord space
-    r = reminds.get(guild_id)
+    # getting the Reminders obj for that discord space
+    r = reminders.get(guild_id)
     if r is None:
         return ""
     command_message = parameters.message
@@ -93,9 +90,7 @@ async def mock(parameters: CommandParameters | str) -> str:
             continue
 
         previous_character_is_upper = (
-            index > 0 and result[-2].isupper()
-            if message[index - 1].isspace()
-            else index > 0 and result[-1].isupper()
+            index > 0 and result[-2].isupper() if message[index - 1].isspace() else index > 0 and result[-1].isupper()
         )
         result += character if previous_character_is_upper else character.upper()
 
@@ -114,7 +109,7 @@ valid_commands: dict[str, Callable[[CommandParameters], Awaitable[str]]] = {
     "git": git,
     "mock": mock,
     "remind": parse_remind_commands,
-    "help": post_help
+    "help": post_help,
 }
 
 
@@ -126,12 +121,12 @@ async def on_ready() -> None:
     for channel in client.get_all_channels():
         if str(channel.category) == "Text Channels":
             _logger.info("Text Channel: %s - %s - %s - %s", channel.guild, channel.guild.id, channel, channel.id)
-            tag_json_path = BOT_PATH.parent / "tags"
-            reminders_json_path = BOT_PATH.parent / "reminders"
+            tag_json_path = BOT_PATH / "tags" / "files"
+            reminders_json_path = BOT_PATH / "reminders" / "files"
             if channel.guild.id not in tags:
                 tags[channel.guild.id] = await Tags.create(channel.guild, tag_json_path)
-            if channel.guild.id not in reminds:
-                reminds[channel.guild.id] = Remind(channel.guild, reminders_json_path, client)
+            if channel.guild.id not in reminders:
+                reminders[channel.guild.id] = Reminders(channel.guild, reminders_json_path, client)
     _logger.info("Initializing Done")
 
 
@@ -166,8 +161,7 @@ async def on_message(message: discord.Message) -> None:
             await message.channel.send(result)
         else:
             invalid_command_message = (
-                f"{user_command} is not a valid command. "
-                f"Here are the commands {await post_help()}"
+                f"{user_command} is not a valid command. Here are the commands {await post_help()}"
             )
             await message.channel.send(invalid_command_message)
 

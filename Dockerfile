@@ -9,7 +9,7 @@ USER smurfbot
 WORKDIR /home/smurfbot
 COPY pyproject.toml .
 RUN uv sync --no-dev --no-cache
-RUN mkdir -p app/src app/logs app/tags app/reminders
-COPY src/* app/src/
+RUN mkdir -p app/src app/logs app/src/tags/files app/src/reminders/files
+COPY src/ app/src/
 WORKDIR /home/smurfbot/app
 CMD ["python","src/start.py", "-c", "config.ini"]

@@ -10,5 +10,5 @@ services:
     cpus: "0.5"
     volumes:
       - ./config.ini:/home/smurfbot/app/config.ini:ro
-      - ./tags:/home/smurfbot/app/tags
-      - ./reminders:/home/smurfbot/app/reminders
+      - ./src/tags/files:/home/smurfbot/app/src/tags/files
+      - ./src/reminders/files:/home/smurfbot/app/src/reminders/files

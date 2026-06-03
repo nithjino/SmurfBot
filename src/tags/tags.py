@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import discord
 from atomicwrites import atomic_write
 
-from models import TagCommandParameters, TagContent, TagFile, TagRecord
+from .models import TagCommandParameters, TagContent, TagFile, TagRecord
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -206,8 +206,8 @@ class Tags:
 
     async def filter_tags(self, keyword: str) -> str:
         """Return tag names that contain a keyword."""
-        filtered_tags = [tag for tag in self.tags.tags if keyword in tag]
-        filtered_tags = ", ".join(filtered_tags)
+        filtered_tag_names = [tag for tag in self.tags.tags if keyword in tag]
+        filtered_tags = ", ".join(filtered_tag_names)
         if not filtered_tags:
             return f"No tags contain the word {keyword}"
         return filtered_tags
