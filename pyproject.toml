@@ -3,9 +3,10 @@ name = "smurfbot"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
-    "discord.py==2.1.0",
-    "atomicwrites==1.4.1",
-    "pytz==2022.6",
+    "discord.py==2.7.1",
+    "atomicwrites",
+    "pytz",
+    "pydantic",
 ]
 
 [tool.uv]
@@ -13,8 +14,8 @@ package = false
 
 [dependency-groups]
 dev = [
-    "mypy>=2.1.0",
-    "ruff>=0.15.15",
+    "mypy",
+    "ruff",
 ]
 
 [tool.ruff]

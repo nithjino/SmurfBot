@@ -9,3 +9,6 @@ local.sh
 *.swp
 src/test.py
 *.bak
+.ruff_cache
+.uv_cache
+.venv

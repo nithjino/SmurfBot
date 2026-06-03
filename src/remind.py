@@ -7,29 +7,34 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING
 
+import discord
 import pytz
 from atomicwrites import atomic_write
+from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    import discord
-
 _logger = logging.getLogger(__name__)
 
-date_format = "%Y-%m-%dT%H:%M:%S"
-human_date_format = "%m/%d/%Y @ %I:%M%p"
+DATE_FORMAT = "%Y-%m-%dT%H:%M:%S"
+HUMAN_DATE_FORMAT = "%m/%d/%Y @ %I:%M%p"
 MAX_REMINDER_SECONDS = 31_557_600
+DURATION_UNIT_SECONDS = {"s": 1, "m": 60, "h": 60 * 60, "d": 60 * 60 * 24}
 
 
-class _DatetimePassedResult(TypedDict):
+class DatetimePassedResult(BaseModel):
+    """Result of comparing a planned execution time with now."""
+
     result: bool
     seconds_until_execution: float
 
 
-class _Reminder(TypedDict):
+class ReminderRecord(BaseModel):
+    """Persisted reminder data."""
+
     user_id: int
     name: str
     message: str
@@ -40,46 +45,45 @@ class _Reminder(TypedDict):
     channel_id: int
 
 
-class _ReminderFile(TypedDict):
+class ReminderFile(BaseModel):
+    """Persisted guild reminder file."""
+
     name: str
     id: int
-    reminders: list[_Reminder]
+    reminders: list[ReminderRecord] = Field(default_factory=list)
 
 
 def parse_time(time: str) -> int | None:
     """Convert a compact duration string into seconds."""
+    if not time:
+        return None
+
+    unit = time[-1].lower()
+    multiplier = DURATION_UNIT_SECONDS.get(unit)
+    if multiplier is None:
+        return None
+
     try:
-        unit = time[-1].lower()
         amount = int(time[:-1])
-        match unit:
-            case "s":
-                pass
-            case "m":
-                amount = amount * 60
-            case "h":
-                amount = amount * 60 * 60
-            case "d":
-                amount = amount * 60 * 60 * 24
-            case _:
-                amount = None
-    except Exception:
-        _logger.exception("remind (parse_time) exception")
-        amount = None
-    return amount
+    except ValueError:
+        _logger.info("Invalid reminder duration: %s", time)
+        return None
+
+    return amount * multiplier
 
 
 def add_time_to_date(date: datetime | str, seconds: int) -> datetime:
     """Add seconds to a UTC datetime or serialized datetime string."""
     if isinstance(date, str):
-        date = datetime.strptime(date, date_format).replace(tzinfo=UTC)
+        date = datetime.strptime(date, DATE_FORMAT).replace(tzinfo=UTC)
     return date + timedelta(seconds=seconds)
 
 
-def has_datetime_passed(planned_execution_date: datetime | str) -> _DatetimePassedResult:
+def has_datetime_passed(planned_execution_date: datetime | str) -> DatetimePassedResult:
     """Report whether a planned UTC execution datetime has passed."""
     current_datetime = datetime.now(UTC)
     if isinstance(planned_execution_date, str):
-        planned_execution_date = datetime.strptime(planned_execution_date, date_format).replace(tzinfo=UTC)
+        planned_execution_date = datetime.strptime(planned_execution_date, DATE_FORMAT).replace(tzinfo=UTC)
     _logger.info(
         "has_datetime_passed() - current_datetime: (%s) %s %s",
         type(current_datetime),
@@ -98,9 +102,12 @@ def has_datetime_passed(planned_execution_date: datetime | str) -> _DatetimePass
             "has_datetime_passed() - seconds_until_execution.total_seconds(): %s",
             (planned_execution_date - current_datetime).total_seconds(),
         )
-        return {"result": False, "seconds_until_execution": (planned_execution_date - current_datetime).total_seconds()}
+        return DatetimePassedResult(
+            result=False,
+            seconds_until_execution=(planned_execution_date - current_datetime).total_seconds(),
+        )
     _logger.info("has_datetime_passed() - %s has passed", planned_execution_date)
-    return {"result": True, "seconds_until_execution": -1}
+    return DatetimePassedResult(result=True, seconds_until_execution=-1)
 
 
 class Remind:
@@ -123,31 +130,29 @@ class Remind:
             _logger.info("created %s", self.reminders_json_path)
         # creates reminders json file for the group if it doesn't exist
         if not self.reminders_json_file.exists():
-            create_json: _ReminderFile = {"name": self.guild.name, "id": self.guild.id, "reminders": []}
+            create_json = ReminderFile(name=self.guild.name, id=self.guild.id)
             with self.reminders_json_file.open("w", encoding="utf-8") as reminders_file:
-                json.dump(create_json, reminders_file)
+                json.dump(create_json.model_dump(mode="json"), reminders_file)
             _logger.info("%s: created: %s", self.guild.name, self.reminders_json_file)
 
-    def load_reminders(self) -> _ReminderFile:
+    def load_reminders(self) -> ReminderFile:
         """Return the guild's reminders JSON data."""
         self.create_json()
         _logger.info("%s: loading: %s", self.guild.name, self.reminders_json_file)
         with self.reminders_json_file.open(encoding="utf-8") as reminders:
-            return json.load(reminders)
+            return ReminderFile.model_validate(json.load(reminders))
 
     def save_reminders(self) -> None:
         """Write the guild's reminders to disk."""
         _logger.info("%s: saving: %s", self.guild.name, self.reminders_json_file)
         with atomic_write(self.reminders_json_file, overwrite=True, encoding="utf-8") as reminders_file:
-            reminders_file.write(json.dumps(self.reminders, sort_keys=True, indent=2))
+            reminders_file.write(json.dumps(self.reminders.model_dump(mode="json"), sort_keys=True, indent=2))
 
     def clean_reminders(self) -> None:
         """Remove expired reminders and persist the cleaned reminder list."""
         _logger.info("%s: cleaning: %s", self.guild.name, self.reminders_json_file)
-        self.reminders["reminders"] = [
-            reminder
-            for reminder in self.reminders["reminders"]
-            if not has_datetime_passed(reminder["execution_time"])["result"]
+        self.reminders.reminders = [
+            reminder for reminder in self.reminders.reminders if not has_datetime_passed(reminder.execution_time).result
         ]
         self.save_reminders()
 
@@ -155,16 +160,14 @@ class Remind:
         """Return a formatted list of active reminders."""
         self.clean_reminders()
         messages: list[str] = []
-        for reminder in self.reminders["reminders"]:
-            reminder_date = reminder["execution_time"]
+        for reminder in self.reminders.reminders:
+            reminder_date = reminder.execution_time
             if isinstance(reminder_date, str):
-                reminder_date = datetime.strptime(reminder_date, date_format).replace(tzinfo=UTC)
+                reminder_date = datetime.strptime(reminder_date, DATE_FORMAT).replace(tzinfo=UTC)
             reminder_date = reminder_date.replace(tzinfo=UTC)
-            display_date = reminder_date.astimezone(pytz.timezone("US/Eastern")).strftime(human_date_format)
+            display_date = reminder_date.astimezone(pytz.timezone("US/Eastern")).strftime(HUMAN_DATE_FORMAT)
             messages.append(
-                f"\nCreated by: {reminder['name']}\n"
-                f"Reminder date: {display_date}\n"
-                f"Reminder message: {reminder['message']}\n"
+                f"\nCreated by: {reminder.name}\nReminder date: {display_date}\nReminder message: {reminder.message}\n"
             )
         if not messages:
             return "No active reminds were found"
@@ -174,27 +177,27 @@ class Remind:
         """Schedule all currently persisted reminders."""
         _logger.info("%s: parse_reminders()", self.guild.name)
         _logger.info("%s: %s", self.guild.name, self.reminders)
-        for reminder in self.reminders["reminders"]:
+        for reminder in self.reminders.reminders:
             await self.parse_reminder(reminder)
 
-    async def parse_reminder(self, reminder: _Reminder) -> None:
+    async def parse_reminder(self, reminder: ReminderRecord) -> None:
         """Schedule a reminder if it has not already expired."""
         _logger.info("%s: parse_reminder()", self.guild.name)
-        passed_result = has_datetime_passed(reminder["execution_time"])
-        if not passed_result["result"]:
+        passed_result = has_datetime_passed(reminder.execution_time)
+        if not passed_result.result:
             self.create_timer(
-                reminder["message"],
-                reminder["user_id"],
-                reminder["name"],
-                passed_result["seconds_until_execution"],
-                reminder["channel_id"],
+                reminder.message,
+                reminder.user_id,
+                reminder.name,
+                passed_result.seconds_until_execution,
+                reminder.channel_id,
             )
         else:
             _logger.info(
                 "%s: parse_reminder() - reminder for %s that says %s alredy expired",
                 self.guild.name,
-                reminder["name"],
-                reminder["message"],
+                reminder.name,
+                reminder.message,
             )
 
     def create_timer(
@@ -220,6 +223,9 @@ class Remind:
         channel = self.guild.get_channel(channel_id)
         if channel is None:
             _logger.warning("%s: channel %s was not found for reminder", self.guild.name, channel_id)
+            return
+        if not isinstance(channel, discord.abc.Messageable):
+            _logger.warning("%s: channel %s cannot receive reminder messages", self.guild.name, channel_id)
             return
         await channel.send(f"<@{user_id}> reminder: {message}")
 
@@ -249,25 +255,25 @@ class Remind:
             return "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"
         if delay_seconds > MAX_REMINDER_SECONDS:
             return "Why are you using this feature for a reminder that far in the future?"
-        message = " ".join(message)
+        reminder_message = " ".join(message)
         created_at = datetime.now(UTC)
-        self.reminders["reminders"].append(
-            {
-                "user_id": user_id,
-                "name": user.name,
-                "message": message,
-                "created_at": created_at.strftime(date_format),
-                "execution_time": add_time_to_date(created_at, delay_seconds).strftime(date_format),
-                "timezone": "utc",
-                "guild_id": guild_id,
-                "channel_id": channel_id,
-            }
+        self.reminders.reminders.append(
+            ReminderRecord(
+                user_id=user_id,
+                name=user.name,
+                message=reminder_message,
+                created_at=created_at.strftime(DATE_FORMAT),
+                execution_time=add_time_to_date(created_at, delay_seconds).strftime(DATE_FORMAT),
+                timezone="utc",
+                guild_id=guild_id,
+                channel_id=channel_id,
+            )
         )
         self.save_reminders()
         execution_time = (
             (created_at + timedelta(seconds=delay_seconds))
             .astimezone(pytz.timezone("US/Eastern"))
-            .strftime(human_date_format)
+            .strftime(HUMAN_DATE_FORMAT)
         )
-        self.create_timer(message, user_id, user.name, delay_seconds, channel_id)
-        return f"Created reminder for {user.name} to go off at {execution_time} that says `{message}`"
+        self.create_timer(reminder_message, user_id, user.name, delay_seconds, channel_id)
+        return f"Created reminder for {user.name} to go off at {execution_time} that says `{reminder_message}`"
