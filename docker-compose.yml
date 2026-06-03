@@ -6,6 +6,8 @@ services:
     container_name: smurfbot
     restart: unless-stopped
     init: true
+    mem_limit: "200m"
+    cpus: "0.5"
     volumes:
       - ./config.ini:/home/smurfbot/app/config.ini:ro
       - ./tags:/home/smurfbot/app/tags
