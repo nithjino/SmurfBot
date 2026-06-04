@@ -15,6 +15,17 @@ MIN_NAMED_VALUE_ARGUMENTS: Final = 2
 TagCommandHandler = Callable[["Tags", TagCommandParameters, list[str]], Awaitable[str]]
 
 
+def parse_discord_user_id(user_id_text: str) -> int | None:
+    """Parse a raw Discord user ID or user mention into an integer ID."""
+    cleaned_user_id = user_id_text.strip()
+    if cleaned_user_id.startswith("<@") and cleaned_user_id.endswith(">"):
+        cleaned_user_id = cleaned_user_id[2:-1].removeprefix("!")
+
+    if not cleaned_user_id.isdecimal():
+        return None
+    return int(cleaned_user_id)
+
+
 async def handle_create(tags: Tags, parameters: TagCommandParameters, message: list[str]) -> str:
     """Handle tag creation."""
     if not message:
@@ -62,12 +73,11 @@ async def handle_rename(tags: Tags, parameters: TagCommandParameters, message: l
 async def handle_gift(tags: Tags, parameters: TagCommandParameters, message: list[str]) -> str:
     """Handle tag ownership transfers."""
     if len(message) < MIN_NAMED_VALUE_ARGUMENTS:
-        return "Usage: tag gift [name] [new owner id]"
+        return "Usage: tag gift [name] [new owner mention or id]"
 
-    try:
-        new_owner = int(message[1])
-    except ValueError:
-        return "The new owner must be a Discord user id"
+    new_owner = parse_discord_user_id(message[1])
+    if new_owner is None:
+        return "The new owner must be a Discord user mention or user id"
 
     return await tags.gift_tag(message[0], parameters.author_id, new_owner)
 

@@ -29,6 +29,7 @@ class Tags:
         self.tags_json_path = Path(tags_json_path)
         self.tags_json_file = self.tags_json_path / f"{guild.id}.json"
         self.tags = TagFile(name=guild.name, id=guild.id)
+        self._tag_lock = asyncio.Lock()
 
     @classmethod
     async def create(cls, guild: discord.Guild, tags_json_path: str | Path) -> Tags:
@@ -76,6 +77,11 @@ class Tags:
 
     async def save_tags(self) -> None:
         """Write the guild's tags to disk."""
+        async with self._tag_lock:
+            await self._save_tags_unlocked()
+
+    async def _save_tags_unlocked(self) -> None:
+        """Write tags to disk while the caller holds the tag lock."""
 
         def save_tags_sync() -> None:
             _logger.info("%s: saving: %s", self.guild.name, self.tags_json_file)
@@ -101,91 +107,102 @@ class Tags:
 
     async def create_tag(self, name: str, content: TagContent, owner: int) -> str:
         """Create a tag owned by the requesting user."""
-        tag_content = content.message if content.attachment is None else content.attachment
-        if name in self.tags.tags:
-            return f'The tag "{name}" already exists'
-        self.tags.tags[name] = TagRecord(owner=owner, content=tag_content)
-        await self.save_tags()
-        return f'The tag "{name}" was created successfully'
+        async with self._tag_lock:
+            if name in self.tags.tags:
+                return f'The tag "{name}" already exists'
+            tag_content = content.attachment if content.attachment is not None else content.message.strip()
+            if not tag_content:
+                return "A tag needs either text content or an attachment"
+            self.tags.tags[name] = TagRecord(owner=owner, content=tag_content)
+            await self._save_tags_unlocked()
+            return f'The tag "{name}" was created successfully'
 
     async def post_tag(self, name: str) -> str:
         """Return the content for a saved tag."""
-        if name in self.tags.tags:
-            return self.tags.tags[name].content
+        async with self._tag_lock:
+            if name in self.tags.tags:
+                return self.tags.tags[name].content
         return f'The tag "{name}" does not exist'
 
     async def delete_tag(self, name: str, owner: int) -> str:
         """Delete a tag when requested by its owner."""
-        if not self.tags.tags:
-            return "There are no tags"
+        async with self._tag_lock:
+            if not self.tags.tags:
+                return "There are no tags"
 
-        if name in self.tags.tags:
-            if self.tags.tags[name].owner == owner:
-                del self.tags.tags[name]
-                await self.save_tags()
-                return f'The tag "{name}" has been deleted'
-            return f'You are not the owner of the tag "{name}"'
+            if name in self.tags.tags:
+                if self.tags.tags[name].owner == owner:
+                    del self.tags.tags[name]
+                    await self._save_tags_unlocked()
+                    return f'The tag "{name}" has been deleted'
+                return f'You are not the owner of the tag "{name}"'
 
         return f'The tag "{name}" does not exist'
 
     async def list_tags(self) -> str:
         """Return a comma-separated list of saved tag names."""
-        if not self.tags.tags:
-            return "No tags exist"
+        async with self._tag_lock:
+            if not self.tags.tags:
+                return "No tags exist"
+            tag_names = list(self.tags.tags)
 
-        return ", ".join(self.tags.tags.keys())
+        return ", ".join(tag_names)
 
     async def edit_tag(self, name: str, owner: int, content: str) -> str:
         """Replace a tag's content when requested by its owner."""
-        if not self.tags.tags:
-            return "There are no tags"
+        async with self._tag_lock:
+            if not self.tags.tags:
+                return "There are no tags"
 
-        if name not in self.tags.tags:
-            return f'The tag "{name}" does not exist'
+            if name not in self.tags.tags:
+                return f'The tag "{name}" does not exist'
 
-        if self.tags.tags[name].owner != owner:
-            return f'You are not the owner of the tag "{name}"'
+            if self.tags.tags[name].owner != owner:
+                return f'You are not the owner of the tag "{name}"'
 
-        self.tags.tags[name].content = content
-        await self.save_tags()
-        return f'The tag "{name}" has been edited'
+            self.tags.tags[name].content = content
+            await self._save_tags_unlocked()
+            return f'The tag "{name}" has been edited'
 
     async def rename_tag(self, old_name: str, new_name: str, owner: int) -> str:
         """Rename a tag when requested by its owner."""
-        if not self.tags.tags:
-            return "There are no tags"
+        async with self._tag_lock:
+            if not self.tags.tags:
+                return "There are no tags"
 
-        if old_name not in self.tags.tags:
-            return f'The tag "{old_name}" does not exist'
+            if old_name not in self.tags.tags:
+                return f'The tag "{old_name}" does not exist'
 
-        if new_name in self.tags.tags:
-            return f'The tag "{new_name}" already exists'
+            if new_name in self.tags.tags:
+                return f'The tag "{new_name}" already exists'
 
-        if self.tags.tags[old_name].owner != owner:
-            return f'You are not the owner of the tag "{old_name}"'
+            if self.tags.tags[old_name].owner != owner:
+                return f'You are not the owner of the tag "{old_name}"'
 
-        self.tags.tags[new_name] = self.tags.tags.pop(old_name)
-        await self.save_tags()
-        return f'The tag "{old_name}" has been renamed to "{new_name}"'
+            self.tags.tags[new_name] = self.tags.tags.pop(old_name)
+            await self._save_tags_unlocked()
+            return f'The tag "{old_name}" has been renamed to "{new_name}"'
 
     async def gift_tag(self, name: str, owner: int, new_owner: int) -> str:
         """Transfer a tag to a new owner when requested by its owner."""
-        if not self.tags.tags:
-            return "There are no tags"
+        async with self._tag_lock:
+            if not self.tags.tags:
+                return "There are no tags"
 
-        if name not in self.tags.tags:
-            return f'The tag "{name}" does not exist'
+            if name not in self.tags.tags:
+                return f'The tag "{name}" does not exist'
 
-        if self.tags.tags[name].owner != owner:
-            return f'You are not the owner of the tag "{name}"'
+            if self.tags.tags[name].owner != owner:
+                return f'You are not the owner of the tag "{name}"'
 
-        self.tags.tags[name].owner = new_owner
-        await self.save_tags()
-        return f'The tag "{name}" has been gifted to {new_owner}'
+            self.tags.tags[name].owner = new_owner
+            await self._save_tags_unlocked()
+            return f'The tag "{name}" has been gifted to {new_owner}'
 
     async def filter_tags(self, keyword: str) -> str:
         """Return tag names that contain a keyword."""
-        filtered_tag_names = [tag for tag in self.tags.tags if keyword in tag]
+        async with self._tag_lock:
+            filtered_tag_names = [tag for tag in self.tags.tags if keyword in tag]
         filtered_tags = ", ".join(filtered_tag_names)
         if not filtered_tags:
             return f"No tags contain the word {keyword}"
@@ -193,12 +210,16 @@ class Tags:
 
     async def find_owner(self, name: str, fetch_user_func: Callable[[int], Awaitable[discord.User]]) -> str:
         """Look up and return the Discord user that owns a tag."""
-        if name in self.tags.tags:
-            try:
-                user = await fetch_user_func(self.tags.tags[name].owner)
-            except discord.NotFound, discord.HTTPException:
-                return f'Ran into an error when trying to get the owner of "{name}"'
-            else:
-                return f'The owner of "{name}" is {user.name}'
+        async with self._tag_lock:
+            tag = self.tags.tags.get(name)
+            if tag is None:
+                return f'The tag "{name}" does not exist'
 
-        return f'The tag "{name}" does not exist'
+            owner = tag.owner
+
+        try:
+            user = await fetch_user_func(owner)
+        except discord.NotFound, discord.HTTPException:
+            return f'Ran into an error when trying to get the owner of "{name}"'
+        else:
+            return f'The owner of "{name}" is {user.name}'

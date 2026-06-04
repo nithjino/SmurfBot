@@ -8,6 +8,7 @@ RUN apk add --no-cache tzdata uv \
 USER smurfbot
 WORKDIR /home/smurfbot
 COPY pyproject.toml .
+COPY uv.lock .
 RUN uv sync --no-dev --no-cache
 RUN mkdir -p app/src app/logs app/src/tags/files app/src/reminders/files
 COPY src/ app/src/

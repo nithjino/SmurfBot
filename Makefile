@@ -11,7 +11,7 @@ format:
 
 lint:
 	@echo "Linting code..."
-	uv run ruff check --exit-zero
+	uv run ruff check
 
 type-check:
 	@echo "Checking types..."

@@ -6,22 +6,37 @@ pipeline {
     stages {
         stage('Install Dependencies') {
             steps {
-                echo "install dependencies"
-                sh 'sleep 10s'
+                sh 'make install-deps'
+            }
+        }
+
+        stage('Format Check') {
+            steps {
+                sh 'uv run ruff format --check'
+            }
+        }
+
+        stage('Lint') {
+            steps {
+                sh 'make lint'
+            }
+        }
+
+        stage('Type Check') {
+            steps {
+                sh 'make type-check'
             }
         }
 
         stage('Create Docker Image') {
             steps {
-                echo "create docker image"
-                sh 'sleep 10s'
+                sh 'make build'
             }
         }
 
         stage('Deploy Docker Image') {
             steps {
-                echo "deploy docker image"
-                sh 'sleep 10s'
+                sh 'make up-detach'
             }
         }
     }

@@ -91,6 +91,7 @@ class Reminders:
         self.reminders = ReminderFile(name=guild.name, id=guild.id)
         self.loop = client.loop
         self._timer_tasks: set[asyncio.Task[None]] = set()
+        self._reminder_lock = asyncio.Lock()
 
     @classmethod
     async def create(cls, guild: discord.Guild, reminders_json_path: str | Path, client: discord.Client) -> Reminders:
@@ -130,6 +131,11 @@ class Reminders:
 
     async def save_reminders(self) -> None:
         """Write the guild's reminders to disk."""
+        async with self._reminder_lock:
+            await self._save_reminders_unlocked()
+
+    async def _save_reminders_unlocked(self) -> None:
+        """Write reminders to disk while the caller holds the reminder lock."""
 
         def save_reminders_sync() -> None:
             _logger.info("%s: saving: %s", self.guild.name, self.reminders_json_file)
@@ -141,16 +147,21 @@ class Reminders:
     async def clean_reminders(self) -> None:
         """Remove expired reminders and persist the cleaned reminder list."""
         _logger.info("%s: cleaning: %s", self.guild.name, self.reminders_json_file)
-        self.reminders.reminders = [
-            reminder for reminder in self.reminders.reminders if not has_datetime_passed(reminder.execution_time).result
-        ]
-        await self.save_reminders()
+        async with self._reminder_lock:
+            self.reminders.reminders = [
+                reminder
+                for reminder in self.reminders.reminders
+                if not has_datetime_passed(reminder.execution_time).result
+            ]
+            await self._save_reminders_unlocked()
 
     async def list_reminders(self) -> str:
         """Return a formatted list of active reminders."""
         await self.clean_reminders()
+        async with self._reminder_lock:
+            reminders = list(self.reminders.reminders)
         messages: list[str] = []
-        for reminder in self.reminders.reminders:
+        for reminder in reminders:
             reminder_date = reminder.execution_time
             if isinstance(reminder_date, str):
                 reminder_date = datetime.strptime(reminder_date, DATE_FORMAT).replace(tzinfo=UTC)
@@ -167,7 +178,9 @@ class Reminders:
         """Schedule all currently persisted reminders."""
         _logger.info("%s: parse_reminders()", self.guild.name)
         _logger.info("%s: %s", self.guild.name, self.reminders)
-        for reminder in self.reminders.reminders:
+        async with self._reminder_lock:
+            reminders = list(self.reminders.reminders)
+        for reminder in reminders:
             await self.parse_reminder(reminder)
 
     async def parse_reminder(self, reminder: ReminderRecord) -> None:
@@ -175,13 +188,7 @@ class Reminders:
         _logger.info("%s: parse_reminder()", self.guild.name)
         passed_result = has_datetime_passed(reminder.execution_time)
         if not passed_result.result:
-            await self.create_timer(
-                reminder.message,
-                reminder.user_id,
-                reminder.name,
-                passed_result.seconds_until_execution,
-                reminder.channel_id,
-            )
+            await self.create_timer(reminder, passed_result.seconds_until_execution)
         else:
             _logger.info(
                 "%s: parse_reminder() - reminder for %s that says %s alredy expired",
@@ -192,34 +199,42 @@ class Reminders:
 
     async def create_timer(
         self,
-        message: str,
-        user_id: int,
-        user_name: str,
+        reminder: ReminderRecord,
         delay_seconds: float,
-        channel_id: int,
     ) -> None:
         """Create an async timer that sends a reminder message later."""
-        task = self.loop.create_task(self.send_message(message, user_id, delay_seconds, channel_id))
+        task = self.loop.create_task(self.send_message(reminder, delay_seconds))
         self._timer_tasks.add(task)
         task.add_done_callback(self._timer_tasks.discard)
         _logger.info(
             "%s: created timer for %s that will execute in %s seconds",
             self.guild.name,
-            user_name,
+            reminder.name,
             delay_seconds,
         )
 
-    async def send_message(self, message: str, user_id: int, seconds: float, channel_id: int) -> None:
+    async def remove_reminder(self, reminder: ReminderRecord) -> None:
+        """Remove a completed reminder from memory and disk."""
+        async with self._reminder_lock:
+            try:
+                self.reminders.reminders.remove(reminder)
+            except ValueError:
+                _logger.info("%s: reminder was already removed: %s", self.guild.name, reminder)
+                return
+            await self._save_reminders_unlocked()
+
+    async def send_message(self, reminder: ReminderRecord, seconds: float) -> None:
         """Wait for the requested delay, then send the reminder to a channel."""
         await asyncio.sleep(seconds)
-        channel = self.guild.get_channel(channel_id)
+        channel = self.guild.get_channel(reminder.channel_id)
         if channel is None:
-            _logger.warning("%s: channel %s was not found for reminder", self.guild.name, channel_id)
+            _logger.warning("%s: channel %s was not found for reminder", self.guild.name, reminder.channel_id)
             return
         if not isinstance(channel, discord.abc.Messageable):
-            _logger.warning("%s: channel %s cannot receive reminder messages", self.guild.name, channel_id)
+            _logger.warning("%s: channel %s cannot receive reminder messages", self.guild.name, reminder.channel_id)
             return
-        await channel.send(f"<@{user_id}> reminder: {message}")
+        await channel.send(f"<@{reminder.user_id}> reminder: {reminder.message}")
+        await self.remove_reminder(reminder)
 
     async def create_reminder(
         self,
@@ -247,25 +262,27 @@ class Reminders:
             return "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"
         if delay_seconds > MAX_REMINDER_SECONDS:
             return "Why are you using this feature for a reminder that far in the future?"
+        if delay_seconds <= 0:
+            return "Why are you trying to set a reminder for the past?"
         reminder_message = " ".join(message)
         created_at = datetime.now(UTC)
-        self.reminders.reminders.append(
-            ReminderRecord(
-                user_id=user_id,
-                name=user.name,
-                message=reminder_message,
-                created_at=created_at.strftime(DATE_FORMAT),
-                execution_time=add_time_to_date(created_at, delay_seconds).strftime(DATE_FORMAT),
-                timezone="utc",
-                guild_id=guild_id,
-                channel_id=channel_id,
-            )
+        reminder = ReminderRecord(
+            user_id=user_id,
+            name=user.name,
+            message=reminder_message,
+            created_at=created_at.strftime(DATE_FORMAT),
+            execution_time=add_time_to_date(created_at, delay_seconds).strftime(DATE_FORMAT),
+            timezone="utc",
+            guild_id=guild_id,
+            channel_id=channel_id,
         )
-        await self.save_reminders()
+        async with self._reminder_lock:
+            self.reminders.reminders.append(reminder)
+            await self._save_reminders_unlocked()
         execution_time = (
             (created_at + timedelta(seconds=delay_seconds))
             .astimezone(pytz.timezone("US/Eastern"))
             .strftime(HUMAN_DATE_FORMAT)
         )
-        await self.create_timer(reminder_message, user_id, user.name, delay_seconds, channel_id)
+        await self.create_timer(reminder, delay_seconds)
         return f"Created reminder for {user.name} to go off at {execution_time} that says `{reminder_message}`"

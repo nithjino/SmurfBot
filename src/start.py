@@ -141,16 +141,14 @@ valid_commands: Final[dict[str, Callable[[CommandParameters], Awaitable[str]]]] 
 async def on_ready() -> None:
     """Initialize per-guild tag and reminder handlers after Discord login."""
     _logger.info("We have logged in as %s", client.user)
-    _logger.info("server - server id - channel - channel id\n=========================================")
-    for channel in client.get_all_channels():
-        if str(channel.category) == "Text Channels":
-            _logger.info("Text Channel: %s - %s - %s - %s", channel.guild, channel.guild.id, channel, channel.id)
-            tag_json_path = BOT_PATH / "tags" / "files"
-            reminders_json_path = BOT_PATH / "reminders" / "files"
-            if channel.guild.id not in tags:
-                tags[channel.guild.id] = await Tags.create(channel.guild, tag_json_path)
-            if channel.guild.id not in reminders:
-                reminders[channel.guild.id] = await Reminders.create(channel.guild, reminders_json_path, client)
+    tag_json_path = BOT_PATH / "tags" / "files"
+    reminders_json_path = BOT_PATH / "reminders" / "files"
+    for guild in client.guilds:
+        _logger.info("Initializing guild: %s - %s", guild.name, guild.id)
+        if guild.id not in tags:
+            tags[guild.id] = await Tags.create(guild, tag_json_path)
+        if guild.id not in reminders:
+            reminders[guild.id] = await Reminders.create(guild, reminders_json_path, client)
     _logger.info("Initializing Done")
 
 
@@ -161,7 +159,7 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if message.content.startswith(DELIM):
-        command_parts = message.content[1:].split(" ")
+        command_parts = message.content[1:].split()
         _logger.info("command: %s", command_parts)
         user_command = command_parts[0]
         if user_command in valid_commands:
