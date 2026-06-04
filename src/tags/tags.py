@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import discord
 from atomicwrites import atomic_write
 
+from .handlers import TAG_COMMAND_HANDLERS
 from .models import TagCommandParameters, TagContent, TagFile, TagRecord
 
 if TYPE_CHECKING:
@@ -48,77 +49,55 @@ class Tags:
 
     async def create_json(self) -> None:
         """Create the tags directory and guild JSON file when missing."""
-        await asyncio.to_thread(self._create_json_sync)
 
-    def _create_json_sync(self) -> None:
-        """Create the tags directory and guild JSON file synchronously when missing."""
-        if not self.tags_json_path.exists():
-            self.tags_json_path.mkdir(parents=True)
-            _logger.info("created %s", self.tags_json_path)
-        # creates tag json file for the group if it doesn't exist
-        if not self.tags_json_file.exists():
-            create_json = TagFile(name=self.guild.name, id=self.guild.id)
-            with self.tags_json_file.open("w", encoding="utf-8") as tags_file:
-                json.dump(create_json.model_dump(mode="json"), tags_file)
-            _logger.info("%s: created: %s", self.guild.name, self.tags_json_file)
+        def create_json_sync() -> None:
+            if not self.tags_json_path.exists():
+                self.tags_json_path.mkdir(parents=True)
+                _logger.info("created %s", self.tags_json_path)
+            # creates tag json file for the group if it doesn't exist
+            if not self.tags_json_file.exists():
+                create_json = TagFile(name=self.guild.name, id=self.guild.id)
+                with self.tags_json_file.open("w", encoding="utf-8") as tags_file:
+                    json.dump(create_json.model_dump(mode="json"), tags_file)
+                _logger.info("%s: created: %s", self.guild.name, self.tags_json_file)
+
+        await asyncio.to_thread(create_json_sync)
 
     async def load_tags(self) -> TagFile:
         """Return the guild's tag JSON data."""
         await self.create_json()
-        return await asyncio.to_thread(self._load_tags_sync)
 
-    def _load_tags_sync(self) -> TagFile:
-        """Return the guild's tag JSON data synchronously."""
-        _logger.info("%s: loading: %s", self.guild.name, self.tags_json_file)
-        with self.tags_json_file.open(encoding="utf-8") as tags_file:
-            return TagFile.model_validate(json.load(tags_file))
+        def load_tags_sync() -> TagFile:
+            _logger.info("%s: loading: %s", self.guild.name, self.tags_json_file)
+            with self.tags_json_file.open(encoding="utf-8") as tags_file:
+                return TagFile.model_validate(json.load(tags_file))
+
+        return await asyncio.to_thread(load_tags_sync)
 
     async def save_tags(self) -> None:
         """Write the guild's tags to disk."""
-        await asyncio.to_thread(self._save_tags_sync)
 
-    def _save_tags_sync(self) -> None:
-        """Write the guild's tags to disk synchronously."""
-        _logger.info("%s: saving: %s", self.guild.name, self.tags_json_file)
-        with atomic_write(self.tags_json_file, overwrite=True, encoding="utf-8") as tag_file:
-            tag_file.write(json.dumps(self.tags.model_dump(mode="json"), sort_keys=True, indent=2))
+        def save_tags_sync() -> None:
+            _logger.info("%s: saving: %s", self.guild.name, self.tags_json_file)
+            with atomic_write(self.tags_json_file, overwrite=True, encoding="utf-8") as tag_file:
+                tag_file.write(json.dumps(self.tags.model_dump(mode="json"), sort_keys=True, indent=2))
+
+        await asyncio.to_thread(save_tags_sync)
 
     async def parse_commands(self, parameters: object) -> str:
         """Dispatch a tag subcommand using parsed message parameters."""
         parameters = TagCommandParameters.model_validate(parameters)
         _logger.info("tags parse_commands parameters: %s", parameters)
+        if not parameters.message:
+            return await self.post_help()
+
         command = parameters.message[0].rstrip()
         message = parameters.message[1:]
-        tag_result = ""
-        match command:
-            case "create":
-                name = message[0]
-                content = TagContent(message=" ".join(message[1:]), attachment=parameters.attachment)
-                owner = parameters.author_id
-                tag_result = await self.create_tag(name, content, owner)
-            case "delete":
-                tag_result = await self.delete_tag(message[0], parameters.author_id)
-            case "list":
-                tag_result = await self.list_tags()
-            case "help":
-                tag_result = await self.post_help()
-            case "edit":
-                tag_result = await self.edit_tag(message[0], parameters.author_id, " ".join(message[1:]))
-            case "rename":
-                tag_result = await self.rename_tag(message[0], message[1], parameters.author_id)
-            case "gift":
-                tag_result = await self.gift_tag(message[0], parameters.author_id, int(message[1]))
-            case "owner":
-                fetch_user_func = parameters.fetch_user_func
-                if fetch_user_func is None:
-                    tag_result = f'Ran into an error when trying to get the owner of "{message[0]}"'
-                else:
-                    tag_result = await self.find_owner(message[0], fetch_user_func)
-            case "filter":
-                tag_result = await self.filter_tags(message[0])
-            case _:
-                tag_result = await self.post_tag(command.strip())
-        return tag_result
+        handler = TAG_COMMAND_HANDLERS.get(command)
+        if handler is None:
+            return await self.post_tag(command.strip())
+
+        return await handler(self, parameters, message)
 
     async def create_tag(self, name: str, content: TagContent, owner: int) -> str:
         """Create a tag owned by the requesting user."""

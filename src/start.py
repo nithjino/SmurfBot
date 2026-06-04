@@ -7,7 +7,7 @@ import argparse
 import configparser
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import discord
 
@@ -103,7 +103,31 @@ async def git(_parameters: CommandParameters | None = None) -> str:
     return f"Here is the source code: {git_url}"
 
 
-valid_commands: dict[str, Callable[[CommandParameters], Awaitable[str]]] = {
+def build_command_parameters(
+    message: discord.Message,
+    user_command: str,
+    command_message: list[str],
+) -> CommandParameters:
+    """Build command context from an incoming Discord message."""
+    parameters = CommandParameters(
+        command=user_command,
+        message=command_message,
+        created_at=message.created_at,
+        author_id=message.author.id,
+        guild_id=message.guild.id if message.guild else None,
+        channel_id=message.channel.id,
+    )
+    if message.attachments:
+        parameters.attachment = message.attachments[0].url
+
+    is_owner_lookup = parameters.command == "tag" and bool(parameters.message) and parameters.message[0] == "owner"
+    if parameters.command == "remind" or is_owner_lookup:
+        parameters.fetch_user_func = client.fetch_user
+
+    return parameters
+
+
+valid_commands: Final[dict[str, Callable[[CommandParameters], Awaitable[str]]]] = {
     "ping": ping,
     "tag": parse_tag_commands,
     "git": git,
@@ -126,7 +150,7 @@ async def on_ready() -> None:
             if channel.guild.id not in tags:
                 tags[channel.guild.id] = await Tags.create(channel.guild, tag_json_path)
             if channel.guild.id not in reminders:
-                reminders[channel.guild.id] = Reminders(channel.guild, reminders_json_path, client)
+                reminders[channel.guild.id] = await Reminders.create(channel.guild, reminders_json_path, client)
     _logger.info("Initializing Done")
 
 
@@ -141,22 +165,7 @@ async def on_message(message: discord.Message) -> None:
         _logger.info("command: %s", command_parts)
         user_command = command_parts[0]
         if user_command in valid_commands:
-            parameters = CommandParameters(
-                command=user_command,
-                message=command_parts[1:],
-                created_at=message.created_at,
-                author_id=message.author.id,
-                guild_id=message.channel.guild.id if message.channel.guild else None,
-                channel_id=message.channel.id,
-            )
-            if message.attachments:
-                parameters.attachment = message.attachments[0].url
-            is_owner_lookup = (
-                parameters.command == "tag" and bool(parameters.message) and parameters.message[0] == "owner"
-            )
-            if parameters.command == "remind" or is_owner_lookup:
-                parameters.fetch_user_func = client.fetch_user
-
+            parameters = build_command_parameters(message, user_command, command_parts[1:])
             result = await valid_commands[user_command](parameters)
             await message.channel.send(result)
         else:
