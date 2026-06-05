@@ -11,16 +11,31 @@ from typing import TYPE_CHECKING, Final
 
 import discord
 
-from constants import BOT_PATH, DELIM, MIN_REMIND_ARGUMENTS
+from discord_messages import send_command_response
 from models import CommandParameters
 from reminders import Reminders
+from reminders.constants import MIN_REMIND_ARGUMENTS
 from tags import Tags
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
 _logger = logging.getLogger(__name__)
-client = discord.Client(intents=discord.Intents.all())
+BOT_PATH: Final[Path] = Path(__file__).resolve().parent
+DELIM: Final[str] = "$"
+
+
+def build_discord_intents() -> discord.Intents:
+    """Return the minimal Discord intents needed for command message handling."""
+    intents = discord.Intents.none()
+    intents.guilds = True
+    intents.guild_messages = True
+    intents.dm_messages = True
+    intents.message_content = True
+    return intents
+
+
+client = discord.Client(intents=build_discord_intents())
 
 
 async def post_help(_parameters: CommandParameters | None = None) -> str:
@@ -159,18 +174,21 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if message.content.startswith(DELIM):
+        if message.content.strip() == DELIM:
+            await send_command_response(message.channel, await post_help())
+            return
         command_parts = message.content[1:].split()
         _logger.info("command: %s", command_parts)
         user_command = command_parts[0]
         if user_command in valid_commands:
             parameters = build_command_parameters(message, user_command, command_parts[1:])
             result = await valid_commands[user_command](parameters)
-            await message.channel.send(result)
+            await send_command_response(message.channel, result)
         else:
             invalid_command_message = (
                 f"{user_command} is not a valid command. Here are the commands {await post_help()}"
             )
-            await message.channel.send(invalid_command_message)
+            await send_command_response(message.channel, invalid_command_message)
 
 
 def configure_logging() -> None:

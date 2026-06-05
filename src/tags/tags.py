@@ -6,10 +6,12 @@ import asyncio
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import discord
 from atomicwrites import atomic_write
+
+from message_limits import DISCORD_MESSAGE_LIMIT, truncate_discord_message, truncate_text
 
 from .handlers import TAG_COMMAND_HANDLERS
 from .models import TagCommandParameters, TagContent, TagFile, TagRecord
@@ -18,6 +20,8 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
 _logger = logging.getLogger(__name__)
+
+MAX_TAGS_PER_GUILD: Final[int] = 200
 
 
 class Tags:
@@ -110,9 +114,12 @@ class Tags:
         async with self._tag_lock:
             if name in self.tags.tags:
                 return f'The tag "{name}" already exists'
+            if len(self.tags.tags) >= MAX_TAGS_PER_GUILD:
+                return f"Tag limit reached. Delete a tag before creating a new one. Limit: {MAX_TAGS_PER_GUILD}"
             tag_content = content.attachment if content.attachment is not None else content.message.strip()
             if not tag_content:
                 return "A tag needs either text content or an attachment"
+            tag_content = truncate_text(tag_content, DISCORD_MESSAGE_LIMIT)
             self.tags.tags[name] = TagRecord(owner=owner, content=tag_content)
             await self._save_tags_unlocked()
             return f'The tag "{name}" was created successfully'
@@ -121,7 +128,7 @@ class Tags:
         """Return the content for a saved tag."""
         async with self._tag_lock:
             if name in self.tags.tags:
-                return self.tags.tags[name].content
+                return truncate_discord_message(self.tags.tags[name].content)
         return f'The tag "{name}" does not exist'
 
     async def delete_tag(self, name: str, owner: int) -> str:
@@ -146,7 +153,7 @@ class Tags:
                 return "No tags exist"
             tag_names = list(self.tags.tags)
 
-        return ", ".join(tag_names)
+        return truncate_discord_message(", ".join(tag_names))
 
     async def edit_tag(self, name: str, owner: int, content: str) -> str:
         """Replace a tag's content when requested by its owner."""
@@ -160,7 +167,7 @@ class Tags:
             if self.tags.tags[name].owner != owner:
                 return f'You are not the owner of the tag "{name}"'
 
-            self.tags.tags[name].content = content
+            self.tags.tags[name].content = truncate_text(content, DISCORD_MESSAGE_LIMIT)
             await self._save_tags_unlocked()
             return f'The tag "{name}" has been edited'
 
@@ -206,7 +213,7 @@ class Tags:
         filtered_tags = ", ".join(filtered_tag_names)
         if not filtered_tags:
             return f"No tags contain the word {keyword}"
-        return filtered_tags
+        return truncate_discord_message(filtered_tags)
 
     async def find_owner(self, name: str, fetch_user_func: Callable[[int], Awaitable[discord.User]]) -> str:
         """Look up and return the Discord user that owns a tag."""
@@ -221,5 +228,5 @@ class Tags:
             user = await fetch_user_func(owner)
         except discord.NotFound, discord.HTTPException:
             return f'Ran into an error when trying to get the owner of "{name}"'
-        else:
-            return f'The owner of "{name}" is {user.name}'
+
+        return f'The owner of "{name}" is {user.name}'

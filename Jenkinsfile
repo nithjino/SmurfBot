@@ -28,6 +28,12 @@ pipeline {
             }
         }
 
+        stage('Unit Tests') {
+            steps {
+                sh 'make test'
+            }
+        }
+
         stage('Create Docker Image') {
             steps {
                 sh 'make build'

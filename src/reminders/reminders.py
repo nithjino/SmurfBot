@@ -13,8 +13,18 @@ import discord
 import pytz
 from atomicwrites import atomic_write
 
-from constants import DATE_FORMAT, DURATION_UNIT_SECONDS, HUMAN_DATE_FORMAT, MAX_REMINDER_SECONDS
+from discord_messages import send_reminder_response
+from message_limits import DISCORD_MESSAGE_LIMIT, truncate_discord_message, truncate_text
 
+from .constants import (
+    DATE_FORMAT,
+    DURATION_UNIT_SECONDS,
+    HUMAN_DATE_FORMAT,
+    MAX_REMINDER_SECONDS,
+    MAX_REMINDERS_PER_GUILD,
+    REMINDER_DELIVERY_ATTEMPTS,
+    REMINDER_DELIVERY_RETRY_DELAY_SECONDS,
+)
 from .models import DatetimePassedResult, ReminderFile, ReminderRecord
 
 if TYPE_CHECKING:
@@ -78,6 +88,18 @@ def has_datetime_passed(planned_execution_date: datetime | str) -> DatetimePasse
         )
     _logger.info("has_datetime_passed() - %s has passed", planned_execution_date)
     return DatetimePassedResult(result=True, seconds_until_execution=-1)
+
+
+def parse_reminder_delay(seconds: str) -> tuple[int | None, str | None]:
+    """Return a valid reminder delay or the user-facing validation error."""
+    delay_seconds = parse_time(seconds)
+    if delay_seconds is None:
+        return None, "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"
+    if delay_seconds > MAX_REMINDER_SECONDS:
+        return None, "Why are you using this feature for a reminder that far in the future?"
+    if delay_seconds <= 0:
+        return None, "Why are you trying to set a reminder for the past?"
+    return delay_seconds, None
 
 
 class Reminders:
@@ -172,7 +194,7 @@ class Reminders:
             )
         if not messages:
             return "No active reminds were found"
-        return "".join(messages)
+        return truncate_discord_message("".join(messages))
 
     async def parse_reminders(self) -> None:
         """Schedule all currently persisted reminders."""
@@ -226,15 +248,51 @@ class Reminders:
     async def send_message(self, reminder: ReminderRecord, seconds: float) -> None:
         """Wait for the requested delay, then send the reminder to a channel."""
         await asyncio.sleep(seconds)
+        for attempt in range(1, REMINDER_DELIVERY_ATTEMPTS + 1):
+            if await self._try_send_reminder(reminder, attempt):
+                await self.remove_reminder(reminder)
+                return
+            if attempt < REMINDER_DELIVERY_ATTEMPTS:
+                await asyncio.sleep(REMINDER_DELIVERY_RETRY_DELAY_SECONDS)
+
+        _logger.error(
+            "%s: failed to send reminder after %s attempts: %s",
+            self.guild.name,
+            REMINDER_DELIVERY_ATTEMPTS,
+            reminder,
+        )
+        await self.remove_reminder(reminder)
+
+    async def _try_send_reminder(self, reminder: ReminderRecord, attempt: int) -> bool:
+        """Try to send a reminder once."""
         channel = self.guild.get_channel(reminder.channel_id)
         if channel is None:
-            _logger.warning("%s: channel %s was not found for reminder", self.guild.name, reminder.channel_id)
-            return
+            _logger.warning(
+                "%s: channel %s was not found for reminder send attempt %s",
+                self.guild.name,
+                reminder.channel_id,
+                attempt,
+            )
+            return False
         if not isinstance(channel, discord.abc.Messageable):
-            _logger.warning("%s: channel %s cannot receive reminder messages", self.guild.name, reminder.channel_id)
-            return
-        await channel.send(f"<@{reminder.user_id}> reminder: {reminder.message}")
-        await self.remove_reminder(reminder)
+            _logger.warning(
+                "%s: channel %s cannot receive reminder messages on attempt %s",
+                self.guild.name,
+                reminder.channel_id,
+                attempt,
+            )
+            return False
+        try:
+            await send_reminder_response(channel, reminder.user_id, reminder.message)
+        except discord.HTTPException:
+            _logger.exception(
+                "%s: failed to send reminder to channel %s on attempt %s",
+                self.guild.name,
+                reminder.channel_id,
+                attempt,
+            )
+            return False
+        return True
 
     async def create_reminder(
         self,
@@ -247,7 +305,6 @@ class Reminders:
         channel_id: int,
     ) -> str:
         """Create, persist, and schedule a reminder from a user command."""
-        user = await fetch_user(user_id)
         match seconds:
             case "help":
                 return (
@@ -257,15 +314,15 @@ class Reminders:
             case "list":
                 return await self.list_reminders()
             case _:
-                delay_seconds = parse_time(seconds)
+                delay_seconds, error_message = parse_reminder_delay(seconds)
         if delay_seconds is None:
-            return "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"
-        if delay_seconds > MAX_REMINDER_SECONDS:
-            return "Why are you using this feature for a reminder that far in the future?"
-        if delay_seconds <= 0:
-            return "Why are you trying to set a reminder for the past?"
-        reminder_message = " ".join(message)
+            if error_message is None:
+                msg = "reminder delay validation failed without an error message"
+                raise ValueError(msg)
+            return error_message
+        reminder_message = truncate_text(" ".join(message), DISCORD_MESSAGE_LIMIT)
         created_at = datetime.now(UTC)
+        user = await fetch_user(user_id)
         reminder = ReminderRecord(
             user_id=user_id,
             name=user.name,
@@ -277,6 +334,11 @@ class Reminders:
             channel_id=channel_id,
         )
         async with self._reminder_lock:
+            if len(self.reminders.reminders) >= MAX_REMINDERS_PER_GUILD:
+                return (
+                    "Reminder limit reached. Delete or wait for a reminder to complete before creating a new one. "
+                    f"Limit: {MAX_REMINDERS_PER_GUILD}"
+                )
             self.reminders.reminders.append(reminder)
             await self._save_reminders_unlocked()
         execution_time = (
@@ -285,4 +347,6 @@ class Reminders:
             .strftime(HUMAN_DATE_FORMAT)
         )
         await self.create_timer(reminder, delay_seconds)
-        return f"Created reminder for {user.name} to go off at {execution_time} that says `{reminder_message}`"
+        return truncate_discord_message(
+            f"Created reminder for {user.name} to go off at {execution_time} that says `{reminder_message}`"
+        )

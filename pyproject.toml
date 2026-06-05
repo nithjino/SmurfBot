@@ -15,6 +15,7 @@ package = false
 [dependency-groups]
 dev = [
     "pyright>=1.1.410",
+    "pytest>=9.0.3",
     "ruff",
 ]
 
@@ -62,3 +63,10 @@ docstring-code-line-length = "dynamic"
 include = ["src"]
 typeCheckingMode = "standard"
 pythonVersion = "3.14"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ANN201", "D", "PLR2004", "S101"]

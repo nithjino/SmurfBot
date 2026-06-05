@@ -17,7 +17,11 @@ type-check:
 	@echo "Checking types..."
 	uv run pyright
 
-full-check: format lint type-check
+test:
+	@echo "Running unit tests..."
+	uv run pytest
+
+full-check: format lint type-check test
 	@echo "All checks passed!"
 
 build:
