@@ -102,6 +102,28 @@ def parse_reminder_delay(seconds: str) -> tuple[int | None, str | None]:
     return delay_seconds, None
 
 
+async def resolve_reminder_user_name(
+    user_id: int,
+    user_name: str | None,
+    fetch_user: Callable[[int], Awaitable[discord.User]] | None,
+) -> str:
+    """Return a reminder creator name without requiring a Discord API lookup."""
+    if user_name:
+        return user_name
+
+    if fetch_user is None:
+        _logger.warning("Unable to resolve user name for reminder creator %s; using user ID", user_id)
+        return str(user_id)
+
+    try:
+        user = await fetch_user(user_id)
+    except discord.NotFound, discord.HTTPException:
+        _logger.exception("Unable to fetch user %s for reminder creator name; using user ID", user_id)
+        return str(user_id)
+
+    return user.name
+
+
 class Reminders:
     """Manage persisted reminders and scheduled reminder messages for a guild."""
 
@@ -300,9 +322,10 @@ class Reminders:
         message: list[str],
         user_id: int,
         _created_at: datetime | None,
-        fetch_user: Callable[[int], Awaitable[discord.User]],
+        fetch_user: Callable[[int], Awaitable[discord.User]] | None,
         guild_id: int | None,
         channel_id: int,
+        user_name: str | None = None,
     ) -> str:
         """Create, persist, and schedule a reminder from a user command."""
         match seconds:
@@ -322,10 +345,10 @@ class Reminders:
             return error_message
         reminder_message = truncate_text(" ".join(message), DISCORD_MESSAGE_LIMIT)
         created_at = datetime.now(UTC)
-        user = await fetch_user(user_id)
+        reminder_user_name = await resolve_reminder_user_name(user_id, user_name, fetch_user)
         reminder = ReminderRecord(
             user_id=user_id,
-            name=user.name,
+            name=reminder_user_name,
             message=reminder_message,
             created_at=created_at.strftime(DATE_FORMAT),
             execution_time=add_time_to_date(created_at, delay_seconds).strftime(DATE_FORMAT),
@@ -348,5 +371,5 @@ class Reminders:
         )
         await self.create_timer(reminder, delay_seconds)
         return truncate_discord_message(
-            f"Created reminder for {user.name} to go off at {execution_time} that says `{reminder_message}`"
+            f"Created reminder for {reminder_user_name} to go off at {execution_time} that says `{reminder_message}`"
         )

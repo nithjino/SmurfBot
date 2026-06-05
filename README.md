@@ -21,6 +21,8 @@ uv sync
 uv run python src/start.py -c config.ini
 ```
 
+By default, mutable bot data is stored under `data/`. Set `SMURFBOT_DATA_DIR` to use a different state directory.
+
 ## Config and Credentials
 
 The bot reads credentials from `config.ini` at the repo root. The Discord token must be under the `keys` section:
@@ -32,15 +34,14 @@ discord = your_discord_bot_token
 
 ## Docker
 
-The Compose service mounts `config.ini`, tag files, and reminder files from the repo:
+The Compose service mounts `config.ini` and a state directory from the repo:
 
 ```text
 ./config.ini -> /home/smurfbot/app/config.ini
-./src/tags/files -> /home/smurfbot/app/src/tags/files
-./src/reminders/files -> /home/smurfbot/app/src/reminders/files
+./data -> /home/smurfbot/data
 ```
 
-Create `config.ini` before starting the container. The `src/tags/files` and `src/reminders/files` directories keep bot data persistent across container restarts.
+Create `config.ini` before starting the container. The container sets `SMURFBOT_DATA_DIR=/home/smurfbot/data`, and the `data/tags` and `data/reminders` directories keep bot data persistent across container restarts.
 
 You can use the Makefile wrappers:
 
@@ -91,7 +92,7 @@ The bot rejects reminders longer than `31557600` seconds, which is about one yea
 
 ### Reminder JSON structure
 
-Reminder files are stored as `src/reminders/files/<guild_id>.json`. The bot creates one reminder file per Discord guild and removes expired reminders when it loads or lists them.
+Reminder files are stored as `<data_dir>/reminders/<guild_id>.json`. By default, local runs use `data/reminders/<guild_id>.json`. The bot creates one reminder file per Discord guild and removes expired reminders when it loads or lists them.
 
 ```json
 {
@@ -152,7 +153,7 @@ The `owner` command returns the owner user ID and attempts to match it to the ow
 
 ### Tag JSON structure
 
-Tag files are stored as `src/tags/files/<guild_id>.json`.
+Tag files are stored as `<data_dir>/tags/<guild_id>.json`. By default, local runs use `data/tags/<guild_id>.json`.
 
 ```json
 {

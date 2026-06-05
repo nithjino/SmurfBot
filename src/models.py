@@ -16,5 +16,6 @@ class CommandParameters(BaseModel):
     fetch_user_func: Any = None
     created_at: Any
     author_id: int
+    author_name: str
     guild_id: int | None
     channel_id: int

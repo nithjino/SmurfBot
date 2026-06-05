@@ -90,6 +90,11 @@ async def fetch_user(user_id: int) -> SimpleNamespace:
     return SimpleNamespace(id=user_id, name="Alice")
 
 
+async def failing_fetch_user(_user_id: int) -> SimpleNamespace:
+    response = SimpleNamespace(status=503, reason="Service Unavailable")
+    raise discord.HTTPException(response, "lookup failed")
+
+
 def make_reminder() -> ReminderRecord:
     return ReminderRecord(
         user_id=1,
@@ -178,6 +183,39 @@ def test_create_reminder_persists_record_and_schedules_timer(tmp_path: Path) -> 
     assert reminder.message == "check laundry"
     assert reminder.guild_id == 202
     assert reminder.channel_id == 303
+
+
+def test_create_reminder_uses_provided_user_name_without_fetching_user(tmp_path: Path) -> None:
+    reminders = RecordingReminders(tmp_path)
+
+    result = run(
+        reminders.create_reminder(
+            "5m",
+            ["check", "laundry"],
+            1,
+            None,
+            None,
+            202,
+            303,
+            user_name="Alice From Message",
+        )
+    )
+
+    assert result.startswith("Created reminder for Alice From Message to go off at ")
+    assert reminders.reminders.reminders[0].name == "Alice From Message"
+
+
+def test_create_reminder_falls_back_to_user_id_when_fetch_user_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    reminders = RecordingReminders(tmp_path)
+
+    with caplog.at_level(logging.ERROR):
+        result = run(reminders.create_reminder("5m", ["check", "laundry"], 1, None, failing_fetch_user, 202, 303))
+
+    assert result.startswith("Created reminder for 1 to go off at ")
+    assert reminders.reminders.reminders[0].name == "1"
+    assert "Unable to fetch user 1 for reminder creator name" in caplog.text
 
 
 def test_create_reminder_truncates_message_and_response_to_discord_limit(tmp_path: Path) -> None:

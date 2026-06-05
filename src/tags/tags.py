@@ -22,6 +22,12 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 MAX_TAGS_PER_GUILD: Final[int] = 200
+RESERVED_TAG_NAMES: Final[frozenset[str]] = frozenset(TAG_COMMAND_HANDLERS)
+
+
+def reserved_tag_name_message(name: str) -> str:
+    """Return the validation message for tag names reserved by subcommands."""
+    return f'The tag name "{name}" is reserved for a tag command'
 
 
 class Tags:
@@ -112,6 +118,8 @@ class Tags:
     async def create_tag(self, name: str, content: TagContent, owner: int) -> str:
         """Create a tag owned by the requesting user."""
         async with self._tag_lock:
+            if name in RESERVED_TAG_NAMES:
+                return reserved_tag_name_message(name)
             if name in self.tags.tags:
                 return f'The tag "{name}" already exists'
             if len(self.tags.tags) >= MAX_TAGS_PER_GUILD:
@@ -179,6 +187,9 @@ class Tags:
 
             if old_name not in self.tags.tags:
                 return f'The tag "{old_name}" does not exist'
+
+            if new_name in RESERVED_TAG_NAMES:
+                return reserved_tag_name_message(new_name)
 
             if new_name in self.tags.tags:
                 return f'The tag "{new_name}" already exists'

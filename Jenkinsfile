@@ -1,8 +1,6 @@
 pipeline {
     agent { label "python" }
 
-    triggers { pollSCM '*/1 * * * *' }
-
     stages {
         stage('Install Dependencies') {
             steps {

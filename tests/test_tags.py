@@ -62,6 +62,20 @@ def test_tag_mutations_enforce_ownership_and_keep_names_consistent(tmp_path: Pat
     assert tags.tags.tags["mission"].owner == 9
 
 
+def test_create_and_rename_reject_reserved_command_names(tmp_path: Path) -> None:
+    tags = make_tags(tmp_path)
+    tags.tags.tags["launch"] = TagRecord(owner=7, content="go now")
+
+    create_result = run(tags.create_tag("list", TagContent(message="shadowed", attachment=None), owner=7))
+    rename_result = run(tags.rename_tag("launch", "help", owner=7))
+
+    assert create_result == 'The tag name "list" is reserved for a tag command'
+    assert rename_result == 'The tag name "help" is reserved for a tag command'
+    assert "list" not in tags.tags.tags
+    assert "help" not in tags.tags.tags
+    assert "launch" in tags.tags.tags
+
+
 def test_parse_commands_routes_known_handlers_and_posts_unknown_tags(tmp_path: Path) -> None:
     tags = make_tags(tmp_path)
     tags.tags.tags["launch"] = TagRecord(owner=7, content="go now")
