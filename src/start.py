@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import configparser
 import logging
 import os
 from pathlib import Path
@@ -16,6 +15,7 @@ from discord_messages import send_command_response
 from models import CommandParameters
 from reminders import Reminders
 from reminders.constants import MIN_REMIND_ARGUMENTS
+from settings import Settings, load_settings
 from tags import Tags
 
 if TYPE_CHECKING:
@@ -25,8 +25,9 @@ _logger = logging.getLogger(__name__)
 BOT_PATH: Final[Path] = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR: Final[Path] = BOT_PATH.parent / "data"
 DATA_DIR_ENV_VAR: Final[str] = "SMURFBOT_DATA_DIR"
-DELIM: Final[str] = "$"
+DEFAULT_DELIM: Final[str] = "$"
 GENERIC_COMMAND_ERROR: Final[str] = "Sorry, something went wrong while handling that command."
+runtime_settings: Settings | None = None
 
 
 def build_discord_intents() -> discord.Intents:
@@ -164,6 +165,19 @@ valid_commands: Final[dict[str, Callable[[CommandParameters], Awaitable[str]]]] 
 }
 
 
+def set_runtime_settings(settings: Settings) -> None:
+    """Store settings loaded during startup for event handlers."""
+    global runtime_settings  # noqa: PLW0603
+    runtime_settings = settings
+
+
+def get_command_delimiter() -> str:
+    """Return the configured command delimiter."""
+    if runtime_settings is None:
+        return DEFAULT_DELIM
+    return runtime_settings.delim
+
+
 def get_data_dir() -> Path:
     """Return the configured directory for mutable bot state."""
     configured_data_dir = os.environ.get(DATA_DIR_ENV_VAR)
@@ -259,11 +273,12 @@ async def on_message(message: discord.Message) -> None:
     if message.author == client.user:
         return
 
-    if message.content.startswith(DELIM):
-        if message.content.strip() == DELIM:
+    command_delimiter = get_command_delimiter()
+    if message.content.startswith(command_delimiter):
+        if message.content.strip() == command_delimiter:
             await send_command_response_or_log(message, await post_help(), "help")
             return
-        command_parts = message.content[1:].split()
+        command_parts = message.content[len(command_delimiter) :].split()
         _logger.info("command: %s", command_parts)
         user_command = command_parts[0]
         if user_command in valid_commands:
@@ -287,15 +302,15 @@ def configure_logging() -> None:
 
 def main() -> None:
     """Parse CLI arguments and start the Discord client."""
+    settings = load_settings()
+    set_runtime_settings(settings)
     configure_logging()
-    config_parser = configparser.ConfigParser()
 
     parser = argparse.ArgumentParser(description="groupme bot")
-    parser.add_argument("-c", "--config", help="ini file containing keys and other bot info", type=str, required=True)
-    args = parser.parse_args()
+    parser.add_argument("-c", "--config", help="deprecated; settings are loaded from environment variables", type=str)
+    parser.parse_args()
 
-    config_parser.read(Path(args.config).resolve())
-    client.run(config_parser["keys"]["discord"])
+    client.run(settings.discord_token.get_secret_value())
 
 
 if __name__ == "__main__":

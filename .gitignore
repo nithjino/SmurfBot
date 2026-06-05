@@ -12,3 +12,4 @@ src/test.py
 .ruff_cache
 .uv-cache
 .venv
+.env

@@ -8,6 +8,13 @@ services:
     init: true
     mem_limit: "200m"
     cpus: "0.5"
+    environment:
+      SMURFBOT_DELIM: '$' # Single quotes prevent Docker Compose from treating $ as variable interpolation.
+      SMURFBOT_CONSUME_TIME: ".1"
+      SMURFBOT_REFRESH_GROUP_INTERVAL: "600"
+      SMURFBOT_DISCORD_TOKEN: "${SMURFBOT_DISCORD_TOKEN:-}"
+      HASHICORP_VAULT_URL: "${HASHICORP_VAULT_URL:-}" # Hosted Vault URL used when SMURFBOT_DISCORD_TOKEN is not set.
+      HASHICORP_VAULT_TOKEN: "${HASHICORP_VAULT_TOKEN:-}" # Hosted Vault auth token used when reading the Discord token.
+      SMURFBOT_VAULT_TOKEN_PATH: "${SMURFBOT_VAULT_TOKEN_PATH:-smurfbot/data/tokens}" # KV v2 API path for the bot secret.
     volumes:
-      - ./config.ini:/home/smurfbot/app/config.ini:ro
       - ./data:/home/smurfbot/data

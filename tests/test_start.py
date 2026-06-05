@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import start
 from models import CommandParameters
+from settings import Settings
 from start import (
     DATA_DIR_ENV_VAR,
     DEFAULT_DATA_DIR,
@@ -218,6 +219,47 @@ def test_on_message_sends_generic_response_when_command_handler_fails(
 
     assert channel.sent_messages == [GENERIC_COMMAND_ERROR]
     assert "Failed to handle command explode in guild 456 channel 789 author 123" in caplog.text
+
+
+def test_on_message_uses_configured_command_delimiter(monkeypatch: pytest.MonkeyPatch) -> None:
+    configured_value = "test-token"
+
+    class RecordingChannel:
+        id = 789
+
+        def __init__(self) -> None:
+            self.sent_messages: list[str] = []
+
+        async def send(self, content: str, **_kwargs: object) -> None:
+            self.sent_messages.append(content)
+
+    async def command(_parameters: CommandParameters) -> str:
+        return "configured delimiter"
+
+    channel = RecordingChannel()
+    message = SimpleNamespace(
+        content="!configured",
+        author=SimpleNamespace(id=123, name="Alice"),
+        guild=SimpleNamespace(id=456),
+        channel=channel,
+        created_at=datetime(2026, 6, 4, tzinfo=UTC),
+        attachments=[],
+    )
+    monkeypatch.setattr(
+        start,
+        "runtime_settings",
+        Settings(
+            delim="!",
+            consume_time=0.1,
+            refresh_group_interval=600,
+            discord_token=configured_value,
+        ),
+    )
+    monkeypatch.setitem(start.valid_commands, "configured", command)
+
+    run(start.on_message(message))
+
+    assert channel.sent_messages == ["configured delimiter"]
 
 
 def test_on_message_logs_when_generic_error_response_cannot_be_sent(

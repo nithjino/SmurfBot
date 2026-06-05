@@ -18,30 +18,42 @@ To run locally:
 
 ```sh
 uv sync
-uv run python src/start.py -c config.ini
+SMURFBOT_DISCORD_TOKEN=your_discord_bot_token uv run python src/start.py
 ```
 
 By default, mutable bot data is stored under `data/`. Set `SMURFBOT_DATA_DIR` to use a different state directory.
 
 ## Config and Credentials
 
-The bot reads credentials from `config.ini` at the repo root. The Discord token must be under the `keys` section:
+The bot loads runtime settings from environment variables:
 
-```ini
-[keys]
-discord = your_discord_bot_token
+```sh
+SMURFBOT_DELIM='$'
+SMURFBOT_CONSUME_TIME=.1
+SMURFBOT_REFRESH_GROUP_INTERVAL=600
+SMURFBOT_DISCORD_TOKEN=your_discord_bot_token
 ```
+
+If `SMURFBOT_DISCORD_TOKEN` is not set, the bot reads the Discord token from Vault. Set `HASHICORP_VAULT_URL` or `SMURFBOT_VAULT_URL`, plus one Vault auth token variable: `HASHICORP_VAULT_TOKEN`, `SMURFBOT_VAULT_TOKEN`, or `VAULT_TOKEN`.
 
 ## Docker
 
-The Compose service mounts `config.ini` and a state directory from the repo:
+The Compose service mounts a state directory from the repo:
 
 ```text
-./config.ini -> /home/smurfbot/app/config.ini
 ./data -> /home/smurfbot/data
 ```
 
-Create `config.ini` before starting the container. The container sets `SMURFBOT_DATA_DIR=/home/smurfbot/data`, and the `data/tags` and `data/reminders` directories keep bot data persistent across container restarts.
+The container sets `SMURFBOT_DATA_DIR=/home/smurfbot/data`, and the `data/tags` and `data/reminders` directories keep bot data persistent across container restarts.
+
+For Docker Compose, export the hosted Vault URL and token, or set `SMURFBOT_DISCORD_TOKEN` directly:
+
+```sh
+export HASHICORP_VAULT_URL=https://vault.example.com
+export HASHICORP_VAULT_TOKEN=your_vault_token
+```
+
+You can also copy `.env.example` to `.env`; Docker Compose automatically reads `.env` for variable interpolation when it is in the same directory as `docker-compose.yml`.
 
 You can use the Makefile wrappers:
 

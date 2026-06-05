@@ -14,4 +14,4 @@ RUN uv sync --frozen --no-dev --no-cache
 RUN mkdir -p app/src app/logs data/tags data/reminders
 COPY --chown=smurfbot:smurfbot src/ app/src/
 WORKDIR /home/smurfbot/app
-CMD ["python","src/start.py", "-c", "config.ini"]
+CMD ["python","src/start.py"]
