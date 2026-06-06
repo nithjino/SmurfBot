@@ -3,13 +3,15 @@
 
 from __future__ import annotations
 
-import argparse
+import asyncio
+import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 import discord
+from atomicwrites import atomic_write
 
 from discord_messages import send_command_response
 from models import CommandParameters
@@ -19,14 +21,18 @@ from settings import Settings, load_settings
 from tags import Tags
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
 _logger = logging.getLogger(__name__)
 BOT_PATH: Final[Path] = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR: Final[Path] = BOT_PATH.parent / "data"
 DATA_DIR_ENV_VAR: Final[str] = "SMURFBOT_DATA_DIR"
+GROUPS_FILENAME: Final[str] = "groups.json"
 DEFAULT_DELIM: Final[str] = "$"
 GENERIC_COMMAND_ERROR: Final[str] = "Sorry, something went wrong while handling that command."
+ACTIVATE_COMMAND: Final[str] = "activate"
+DEACTIVE_COMMAND: Final[str] = "deactive"
+DEACTIVATE_COMMAND: Final[str] = "deactivate"
 runtime_settings: Settings | None = None
 
 
@@ -45,7 +51,7 @@ client = discord.Client(intents=build_discord_intents())
 
 async def post_help(_parameters: CommandParameters | None = None) -> str:
     """:return: a string containing what commands the bot has"""
-    return "The commands are: tag, git, and remind. Each one has their own help command except for git."
+    return "The commands are: tag, git, remind, activate, and deactive. Tag and remind have their own help commands."
 
 
 tags: dict[int, Tags] = {}
@@ -192,6 +198,150 @@ def get_state_paths() -> tuple[Path, Path]:
     return data_dir / "tags", data_dir / "reminders"
 
 
+def get_groups_path() -> Path:
+    """Return the path to the group and DM activation state file."""
+    return get_data_dir() / GROUPS_FILENAME
+
+
+def load_group_records_sync(groups_path: Path) -> dict[str, dict[str, Any]]:
+    """Return persisted group activation records."""
+    if not groups_path.exists():
+        return {}
+    with groups_path.open(encoding="utf-8") as groups_file:
+        records = json.load(groups_file)
+    if not isinstance(records, dict):
+        msg = f"{groups_path} must contain a JSON object"
+        raise TypeError(msg)
+    return records
+
+
+async def load_group_records(groups_path: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Load group activation records without blocking the event loop."""
+    return await asyncio.to_thread(load_group_records_sync, groups_path or get_groups_path())
+
+
+def save_group_records_sync(groups_path: Path, records: dict[str, dict[str, Any]]) -> None:
+    """Persist group activation records."""
+    groups_path.parent.mkdir(parents=True, exist_ok=True)
+    with atomic_write(groups_path, overwrite=True, encoding="utf-8") as groups_file:
+        groups_file.write(json.dumps(records, sort_keys=True, indent=2))
+
+
+async def save_group_records(records: dict[str, dict[str, Any]], groups_path: Path | None = None) -> None:
+    """Save group activation records without blocking the event loop."""
+    await asyncio.to_thread(save_group_records_sync, groups_path or get_groups_path(), records)
+
+
+def unique_group_name(records: dict[str, dict[str, Any]], name: str, group_id: str) -> str:
+    """Return a stable name key for a group record."""
+    existing_record = records.get(name)
+    if existing_record is None or str(existing_record.get("id")) == group_id:
+        return name
+    return f"{name} ({group_id})"
+
+
+def upsert_group_record(records: dict[str, dict[str, Any]], name: str, group_id: int | str) -> bool:
+    """Add or rename a group record while preserving its enabled value."""
+    group_id = str(group_id)
+    existing_key = next((key for key, record in records.items() if str(record.get("id")) == group_id), None)
+    if existing_key is not None:
+        record = records[existing_key]
+        enabled = bool(record.get("enabled", True))
+        name = unique_group_name(records, name, group_id)
+        if existing_key != name:
+            del records[existing_key]
+            records[name] = {"enabled": enabled, "id": group_id}
+            return True
+        normalized_record = {"enabled": enabled, "id": group_id}
+        if record != normalized_record:
+            records[name] = normalized_record
+            return True
+        return False
+
+    records[unique_group_name(records, name, group_id)] = {"enabled": True, "id": group_id}
+    return True
+
+
+def get_private_channel_name(channel: object) -> str:
+    """Return a display name for a Discord DM or group DM channel."""
+    recipient = getattr(channel, "recipient", None)
+    if recipient is not None and getattr(recipient, "name", None):
+        return f"DM: {recipient.name}"
+    name = getattr(channel, "name", None)
+    if name:
+        return f"DM: {name}"
+    recipients = getattr(channel, "recipients", None)
+    if recipients:
+        recipient_names = ", ".join(getattr(recipient, "name", str(recipient)) for recipient in recipients)
+        return f"DM: {recipient_names}"
+    return f"DM: {getattr(channel, 'id', 'unknown')}"
+
+
+def get_message_group_name_and_id(message: discord.Message) -> tuple[str, int]:
+    """Return the group state identity for an incoming Discord message."""
+    if message.guild is not None:
+        return message.guild.name, message.guild.id
+    return get_private_channel_name(message.channel), message.channel.id
+
+
+async def sync_group_records(
+    guilds: Sequence[discord.Guild],
+    private_channels: Sequence[discord.abc.PrivateChannel],
+    groups_path: Path | None = None,
+) -> None:
+    """Write all visible guilds and cached DMs to the group activation file."""
+    groups_path = groups_path or get_groups_path()
+    records = await load_group_records(groups_path)
+    changed = False
+    for guild in guilds:
+        changed = upsert_group_record(records, guild.name, guild.id) or changed
+    for channel in private_channels:
+        changed = upsert_group_record(records, get_private_channel_name(channel), channel.id) or changed
+    if changed or not groups_path.exists():
+        await save_group_records(records, groups_path)
+
+
+async def is_message_group_enabled(message: discord.Message) -> bool:
+    """Return whether the message context is enabled for bot command responses."""
+    name, group_id = get_message_group_name_and_id(message)
+    groups_path = get_groups_path()
+    records = await load_group_records(groups_path)
+    changed = upsert_group_record(records, name, group_id)
+    enabled = next(
+        (bool(record.get("enabled", True)) for record in records.values() if str(record.get("id")) == str(group_id)),
+        True,
+    )
+    if changed:
+        await save_group_records(records, groups_path)
+    return enabled
+
+
+def can_manage_group_state(message: discord.Message) -> bool:
+    """Return whether the command author can change the current group state."""
+    if message.guild is None:
+        return True
+    permissions = getattr(message.author, "guild_permissions", None)
+    return bool(getattr(permissions, "administrator", False) or getattr(permissions, "manage_guild", False))
+
+
+async def set_message_group_enabled(message: discord.Message, *, enabled: bool) -> str:
+    """Enable or disable command responses for the current Discord context."""
+    if not can_manage_group_state(message):
+        return "Only server admins can activate or deactive this bot."
+
+    name, group_id = get_message_group_name_and_id(message)
+    groups_path = get_groups_path()
+    records = await load_group_records(groups_path)
+    upsert_group_record(records, name, group_id)
+    for record in records.values():
+        if str(record.get("id")) == str(group_id):
+            record["enabled"] = enabled
+            break
+    await save_group_records(records, groups_path)
+    state = "activated" if enabled else "deactived"
+    return f"{name} has been {state}."
+
+
 async def send_command_response_or_log(message: discord.Message, content: str, user_command: str) -> None:
     """Send a command response and log enough Discord context when sending fails."""
     try:
@@ -254,6 +404,7 @@ async def initialize_guild_handlers(
 async def on_ready() -> None:
     """Initialize per-guild tag and reminder handlers after Discord login."""
     _logger.info("We have logged in as %s", client.user)
+    await sync_group_records(client.guilds, client.private_channels)
     tag_json_path, reminders_json_path = get_state_paths()
     for guild in client.guilds:
         await initialize_guild_handlers(guild, tag_json_path, reminders_json_path)
@@ -263,6 +414,10 @@ async def on_ready() -> None:
 @client.event
 async def on_guild_join(guild: discord.Guild) -> None:
     """Initialize tag and reminder handlers when the bot joins a new guild."""
+    groups_path = get_groups_path()
+    records = await load_group_records(groups_path)
+    if upsert_group_record(records, guild.name, guild.id):
+        await save_group_records(records, groups_path)
     tag_json_path, reminders_json_path = get_state_paths()
     await initialize_guild_handlers(guild, tag_json_path, reminders_json_path)
 
@@ -275,12 +430,28 @@ async def on_message(message: discord.Message) -> None:
 
     command_delimiter = get_command_delimiter()
     if message.content.startswith(command_delimiter):
-        if message.content.strip() == command_delimiter:
+        command_parts = message.content[len(command_delimiter) :].split()
+        if not command_parts:
+            if not await is_message_group_enabled(message):
+                return
             await send_command_response_or_log(message, await post_help(), "help")
             return
-        command_parts = message.content[len(command_delimiter) :].split()
+
         _logger.info("command: %s", command_parts)
-        user_command = command_parts[0]
+        user_command = command_parts[0].lower()
+        if user_command == ACTIVATE_COMMAND:
+            result = await set_message_group_enabled(message, enabled=True)
+            await send_command_response_or_log(message, result, user_command)
+            return
+
+        if not await is_message_group_enabled(message):
+            return
+
+        if user_command in {DEACTIVE_COMMAND, DEACTIVATE_COMMAND}:
+            result = await set_message_group_enabled(message, enabled=False)
+            await send_command_response_or_log(message, result, user_command)
+            return
+
         if user_command in valid_commands:
             result = await dispatch_command(message, user_command, command_parts[1:])
             await send_command_response_or_log(message, result, user_command)
@@ -305,10 +476,6 @@ def main() -> None:
     settings = load_settings()
     set_runtime_settings(settings)
     configure_logging()
-
-    parser = argparse.ArgumentParser(description="groupme bot")
-    parser.add_argument("-c", "--config", help="deprecated; settings are loaded from environment variables", type=str)
-    parser.parse_args()
 
     client.run(settings.discord_token.get_secret_value())
 

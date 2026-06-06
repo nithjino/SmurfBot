@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -34,6 +35,67 @@ def run[T](coro: Coroutine[object, object, T]) -> T:
     return asyncio.run(coro)
 
 
+def test_sync_group_records_creates_groups_file_with_enabled_defaults(tmp_path: Path) -> None:
+    groups_path = tmp_path / "groups.json"
+    guilds = [SimpleNamespace(id=101, name="Guild One"), SimpleNamespace(id=202, name="Guild Two")]
+    private_channels = [
+        SimpleNamespace(id=303, recipient=SimpleNamespace(name="Alice")),
+        SimpleNamespace(id=404, name="Group Chat"),
+    ]
+
+    run(start.sync_group_records(guilds, private_channels, groups_path))
+
+    assert json.loads(groups_path.read_text(encoding="utf-8")) == {
+        "DM: Alice": {"enabled": True, "id": "303"},
+        "DM: Group Chat": {"enabled": True, "id": "404"},
+        "Guild One": {"enabled": True, "id": "101"},
+        "Guild Two": {"enabled": True, "id": "202"},
+    }
+
+
+def test_sync_group_records_preserves_enabled_values_and_updates_renamed_groups(tmp_path: Path) -> None:
+    groups_path = tmp_path / "groups.json"
+    groups_path.write_text(
+        json.dumps(
+            {
+                "Old Guild Name": {"enabled": False, "id": "101"},
+                "DM: Old Alice": {"enabled": False, "id": "303"},
+                "Manual Server": {"enabled": True, "id": "999"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    guilds = [SimpleNamespace(id=101, name="New Guild Name")]
+    private_channels = [SimpleNamespace(id=303, recipient=SimpleNamespace(name="Alice"))]
+
+    run(start.sync_group_records(guilds, private_channels, groups_path))
+
+    assert json.loads(groups_path.read_text(encoding="utf-8")) == {
+        "DM: Alice": {"enabled": False, "id": "303"},
+        "Manual Server": {"enabled": True, "id": "999"},
+        "New Guild Name": {"enabled": False, "id": "101"},
+    }
+
+
+def test_on_guild_join_preserves_enabled_value_when_name_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    groups_path = tmp_path / "groups.json"
+    groups_path.write_text(json.dumps({"Old Name": {"enabled": False, "id": "303"}}), encoding="utf-8")
+
+    async def record_initialize_guild_handlers(_guild: object, _tag_path: Path, _reminder_path: Path) -> None:
+        return None
+
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setattr(start, "initialize_guild_handlers", record_initialize_guild_handlers)
+
+    run(start.on_guild_join(SimpleNamespace(id=303, name="New Name")))
+
+    assert json.loads(groups_path.read_text(encoding="utf-8")) == {
+        "New Name": {"enabled": False, "id": "303"}
+    }
+
+
 def test_mock_accepts_raw_strings_and_command_parameters() -> None:
     raw_result = run(mock("  Ship IT  "))
     parameter_result = run(
@@ -59,7 +121,7 @@ def test_build_command_parameters_preserves_discord_context_and_attachment() -> 
     message = SimpleNamespace(
         created_at=datetime(2026, 6, 4, tzinfo=UTC),
         author=SimpleNamespace(id=123, name="Alice"),
-        guild=SimpleNamespace(id=456),
+        guild=SimpleNamespace(id=456, name="Guild"),
         channel=SimpleNamespace(id=789),
         attachments=[attachment],
     )
@@ -81,7 +143,7 @@ def test_build_command_parameters_sets_fetch_user_only_for_tag_owner() -> None:
     message = SimpleNamespace(
         created_at=datetime(2026, 6, 4, tzinfo=UTC),
         author=SimpleNamespace(id=123, name="Alice"),
-        guild=SimpleNamespace(id=456),
+        guild=SimpleNamespace(id=456, name="Guild"),
         channel=SimpleNamespace(id=789),
         attachments=[],
     )
@@ -188,7 +250,7 @@ def test_on_guild_join_initializes_joined_guild(tmp_path: Path, monkeypatch: pyt
 
 
 def test_on_message_sends_generic_response_when_command_handler_fails(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     class RecordingChannel:
         id = 789
@@ -207,11 +269,12 @@ def test_on_message_sends_generic_response_when_command_handler_fails(
     message = SimpleNamespace(
         content="$explode now",
         author=SimpleNamespace(id=123, name="Alice"),
-        guild=SimpleNamespace(id=456),
+        guild=SimpleNamespace(id=456, name="Guild"),
         channel=channel,
         created_at=datetime(2026, 6, 4, tzinfo=UTC),
         attachments=[],
     )
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
     monkeypatch.setitem(start.valid_commands, "explode", failing_command)
 
     with caplog.at_level(logging.ERROR):
@@ -221,7 +284,7 @@ def test_on_message_sends_generic_response_when_command_handler_fails(
     assert "Failed to handle command explode in guild 456 channel 789 author 123" in caplog.text
 
 
-def test_on_message_uses_configured_command_delimiter(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_on_message_uses_configured_command_delimiter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     configured_value = "test-token"
 
     class RecordingChannel:
@@ -240,11 +303,12 @@ def test_on_message_uses_configured_command_delimiter(monkeypatch: pytest.Monkey
     message = SimpleNamespace(
         content="!configured",
         author=SimpleNamespace(id=123, name="Alice"),
-        guild=SimpleNamespace(id=456),
+        guild=SimpleNamespace(id=456, name="Guild"),
         channel=channel,
         created_at=datetime(2026, 6, 4, tzinfo=UTC),
         attachments=[],
     )
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
     monkeypatch.setattr(
         start,
         "runtime_settings",
@@ -262,8 +326,83 @@ def test_on_message_uses_configured_command_delimiter(monkeypatch: pytest.Monkey
     assert channel.sent_messages == ["configured delimiter"]
 
 
+def test_on_message_deactive_disables_commands_until_activate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RecordingChannel:
+        id = 789
+
+        def __init__(self) -> None:
+            self.sent_messages: list[str] = []
+
+        async def send(self, content: str, **_kwargs: object) -> None:
+            self.sent_messages.append(content)
+
+    channel = RecordingChannel()
+    author = SimpleNamespace(id=123, name="Alice", guild_permissions=SimpleNamespace(administrator=True))
+    message = SimpleNamespace(
+        content="$deactive",
+        author=author,
+        guild=SimpleNamespace(id=456, name="Guild"),
+        channel=channel,
+        created_at=datetime(2026, 6, 4, tzinfo=UTC),
+        attachments=[],
+    )
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+
+    run(start.on_message(message))
+    message.content = "$ping"
+    run(start.on_message(message))
+    message.content = "$deactive"
+    run(start.on_message(message))
+    message.content = "$activate"
+    run(start.on_message(message))
+    message.content = "$ping"
+    run(start.on_message(message))
+
+    assert channel.sent_messages == ["Guild has been deactived.", "Guild has been activated.", "pong"]
+    assert json.loads((tmp_path / "groups.json").read_text(encoding="utf-8")) == {
+        "Guild": {"enabled": True, "id": "456"}
+    }
+
+
+def test_on_message_rejects_group_state_changes_from_non_admin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class RecordingChannel:
+        id = 789
+
+        def __init__(self) -> None:
+            self.sent_messages: list[str] = []
+
+        async def send(self, content: str, **_kwargs: object) -> None:
+            self.sent_messages.append(content)
+
+    channel = RecordingChannel()
+    message = SimpleNamespace(
+        content="$deactive",
+        author=SimpleNamespace(
+            id=123,
+            name="Alice",
+            guild_permissions=SimpleNamespace(administrator=False, manage_guild=False),
+        ),
+        guild=SimpleNamespace(id=456, name="Guild"),
+        channel=channel,
+        created_at=datetime(2026, 6, 4, tzinfo=UTC),
+        attachments=[],
+    )
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+
+    run(start.on_message(message))
+
+    assert channel.sent_messages == ["Only server admins can activate or deactive this bot."]
+    assert json.loads((tmp_path / "groups.json").read_text(encoding="utf-8")) == {
+        "Guild": {"enabled": True, "id": "456"}
+    }
+
+
 def test_on_message_logs_when_generic_error_response_cannot_be_sent(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     class FailingChannel:
         id = 789
@@ -279,11 +418,12 @@ def test_on_message_logs_when_generic_error_response_cannot_be_sent(
     message = SimpleNamespace(
         content="$explode now",
         author=SimpleNamespace(id=123, name="Alice"),
-        guild=SimpleNamespace(id=456),
+        guild=SimpleNamespace(id=456, name="Guild"),
         channel=FailingChannel(),
         created_at=datetime(2026, 6, 4, tzinfo=UTC),
         attachments=[],
     )
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
     monkeypatch.setitem(start.valid_commands, "explode", failing_command)
 
     with caplog.at_level(logging.ERROR):
