@@ -60,30 +60,22 @@ class Tags:
 
     async def create_json(self) -> None:
         """Create the tags directory and guild JSON file when missing."""
-
-        def create_json_sync() -> None:
-            if not self.tags_json_path.exists():
-                self.tags_json_path.mkdir(parents=True)
-                _logger.info("created %s", self.tags_json_path)
-            # creates tag json file for the group if it doesn't exist
-            if not self.tags_json_file.exists():
-                create_json = TagFile(name=self.guild.name, id=self.guild.id)
-                with self.tags_json_file.open("w", encoding="utf-8") as tags_file:
-                    json.dump(create_json.model_dump(mode="json"), tags_file)
-                _logger.info("%s: created: %s", self.guild.name, self.tags_json_file)
-
-        await asyncio.to_thread(create_json_sync)
+        if not self.tags_json_path.exists():
+            self.tags_json_path.mkdir(parents=True)
+            _logger.info("created %s", self.tags_json_path)
+        # creates tag json file for the group if it doesn't exist
+        if not self.tags_json_file.exists():
+            create_json = TagFile(name=self.guild.name, id=self.guild.id)
+            with self.tags_json_file.open("w", encoding="utf-8") as tags_file:
+                json.dump(create_json.model_dump(mode="json"), tags_file)
+            _logger.info("%s: created: %s", self.guild.name, self.tags_json_file)
 
     async def load_tags(self) -> TagFile:
         """Return the guild's tag JSON data."""
         await self.create_json()
-
-        def load_tags_sync() -> TagFile:
-            _logger.info("%s: loading: %s", self.guild.name, self.tags_json_file)
-            with self.tags_json_file.open(encoding="utf-8") as tags_file:
-                return TagFile.model_validate(json.load(tags_file))
-
-        return await asyncio.to_thread(load_tags_sync)
+        _logger.info("%s: loading: %s", self.guild.name, self.tags_json_file)
+        with self.tags_json_file.open(encoding="utf-8") as tags_file:
+            return TagFile.model_validate(json.load(tags_file))
 
     async def save_tags(self) -> None:
         """Write the guild's tags to disk."""
@@ -92,13 +84,9 @@ class Tags:
 
     async def _save_tags_unlocked(self) -> None:
         """Write tags to disk while the caller holds the tag lock."""
-
-        def save_tags_sync() -> None:
-            _logger.info("%s: saving: %s", self.guild.name, self.tags_json_file)
-            with atomic_write(self.tags_json_file, overwrite=True, encoding="utf-8") as tag_file:
-                tag_file.write(json.dumps(self.tags.model_dump(mode="json"), sort_keys=True, indent=2))
-
-        await asyncio.to_thread(save_tags_sync)
+        _logger.info("%s: saving: %s", self.guild.name, self.tags_json_file)
+        with atomic_write(self.tags_json_file, overwrite=True, encoding="utf-8") as tag_file:
+            tag_file.write(json.dumps(self.tags.model_dump(mode="json"), sort_keys=True, indent=2))
 
     async def parse_commands(self, parameters: object) -> str:
         """Dispatch a tag subcommand using parsed message parameters."""
