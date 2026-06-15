@@ -63,6 +63,8 @@ docstring-code-line-length = "dynamic"
 include = ["src"]
 typeCheckingMode = "standard"
 pythonVersion = "3.14"
+venv = ".venv"
+venvPath = "."
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -21,22 +21,43 @@ GROUPS_FILENAME: Final[str] = "groups.json"
 class GroupIdentity(Protocol):
     """Minimal Discord guild/channel identity stored in group records."""
 
-    id: int
-    name: str
+    @property
+    def id(self) -> int:
+        """Discord snowflake ID."""
+        ...
+
+    @property
+    def name(self) -> str:
+        """Discord display name."""
+        ...
 
 
 class MessageChannel(Protocol):
     """Minimal Discord message channel identity stored in group records."""
 
-    id: int
+    @property
+    def id(self) -> int:
+        """Discord snowflake ID."""
+        ...
 
 
 class MessageContext(Protocol):
     """Minimal incoming message shape needed for activation state."""
 
-    author: object
-    channel: MessageChannel
-    guild: GroupIdentity | None
+    @property
+    def author(self) -> object:
+        """Discord message author."""
+        ...
+
+    @property
+    def channel(self) -> MessageChannel:
+        """Discord message channel."""
+        ...
+
+    @property
+    def guild(self) -> GroupIdentity | None:
+        """Discord guild, when the message was sent in a guild."""
+        ...
 
 
 def get_data_dir() -> Path:

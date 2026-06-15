@@ -91,9 +91,7 @@ def test_on_guild_join_preserves_enabled_value_when_name_changes(
 
     run(start.on_guild_join(SimpleNamespace(id=303, name="New Name")))
 
-    assert json.loads(groups_path.read_text(encoding="utf-8")) == {
-        "New Name": {"enabled": False, "id": "303"}
-    }
+    assert json.loads(groups_path.read_text(encoding="utf-8")) == {"New Name": {"enabled": False, "id": "303"}}
 
 
 def test_mock_accepts_raw_strings_and_command_parameters() -> None:
@@ -326,9 +324,38 @@ def test_on_message_uses_configured_command_delimiter(tmp_path: Path, monkeypatc
     assert channel.sent_messages == ["configured delimiter"]
 
 
-def test_on_message_deactive_disables_commands_until_activate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_on_message_silently_ignores_unknown_commands_but_logs_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    class RecordingChannel:
+        id = 789
+
+        def __init__(self) -> None:
+            self.sent_messages: list[str] = []
+
+        async def send(self, content: str, **_kwargs: object) -> None:
+            self.sent_messages.append(content)
+
+    channel = RecordingChannel()
+    message = SimpleNamespace(
+        content="$500 is the cost",
+        author=SimpleNamespace(id=123, name="Alice"),
+        guild=SimpleNamespace(id=456, name="Guild"),
+        channel=channel,
+        created_at=datetime(2026, 6, 4, tzinfo=UTC),
+        attachments=[],
+    )
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+
+    with caplog.at_level(logging.INFO):
+        run(start.on_message(message))
+
+    assert channel.sent_messages == []
+    assert "command: ['500', 'is', 'the', 'cost']" in caplog.text
+    assert "Ignoring unknown command: 500" in caplog.text
+
+
+def test_on_message_deactive_disables_commands_until_activate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class RecordingChannel:
         id = 789
 
@@ -366,9 +393,7 @@ def test_on_message_deactive_disables_commands_until_activate(
     }
 
 
-def test_on_message_rejects_group_state_changes_from_non_admin(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_on_message_rejects_group_state_changes_from_non_admin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     class RecordingChannel:
         id = 789
 

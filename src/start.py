@@ -251,8 +251,7 @@ async def handle_command_message(message: discord.Message, command_parts: list[s
         result = await dispatch_command(message, user_command, command_parts[1:])
         await send_command_response_or_log(message, result, user_command)
     else:
-        invalid_command_message = f"{user_command} is not a valid command. Here are the commands {await post_help()}"
-        await send_command_response_or_log(message, invalid_command_message, user_command)
+        _logger.info("Ignoring unknown command: %s", user_command)
 
 
 def configure_logging() -> None:
