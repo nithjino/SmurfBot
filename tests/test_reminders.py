@@ -33,15 +33,14 @@ def run[T](coro: Coroutine[object, object, T]) -> T:
 
 class RecordingReminders(Reminders):
     def __init__(self, reminders_json_path: Path) -> None:
-        client = SimpleNamespace(loop=SimpleNamespace())
-        super().__init__(SimpleNamespace(id=202, name="Guild"), reminders_json_path, client)
+        super().__init__(SimpleNamespace(id=202, name="Guild"), reminders_json_path)
         self.saved_count = 0
         self.created_timers: list[tuple[ReminderRecord, float]] = []
 
     async def _save_reminders_unlocked(self) -> None:
         self.saved_count += 1
 
-    async def create_timer(self, reminder: ReminderRecord, delay_seconds: float) -> None:
+    def create_timer(self, reminder: ReminderRecord, delay_seconds: float) -> None:
         self.created_timers.append((reminder, delay_seconds))
 
 
@@ -60,9 +59,8 @@ class FakeGuild:
 
 class RecordingDeliveryReminders(Reminders):
     def __init__(self, channel: object, reminders_json_path: Path) -> None:
-        client = SimpleNamespace(loop=SimpleNamespace())
         self.fake_guild = FakeGuild(channel)
-        super().__init__(self.fake_guild, reminders_json_path, client)
+        super().__init__(self.fake_guild, reminders_json_path)
         self.saved_count = 0
 
     async def _save_reminders_unlocked(self) -> None:
@@ -84,15 +82,6 @@ class FlakyMessageable(discord.abc.Messageable):
             raise discord.HTTPException(response, "send failed")
         self.sent_messages.append(str(args[0]))
         self.sent_kwargs.append(kwargs)
-
-
-async def fetch_user(user_id: int) -> SimpleNamespace:
-    return SimpleNamespace(id=user_id, name="Alice")
-
-
-async def failing_fetch_user(_user_id: int) -> SimpleNamespace:
-    response = SimpleNamespace(status=503, reason="Service Unavailable")
-    raise discord.HTTPException(response, "lookup failed")
 
 
 def make_reminder() -> ReminderRecord:
@@ -150,9 +139,9 @@ def test_add_time_and_has_datetime_passed_support_datetime_strings() -> None:
 def test_create_reminder_rejects_invalid_durations_without_persisting(tmp_path: Path) -> None:
     reminders = RecordingReminders(tmp_path)
 
-    unsupported = run(reminders.create_reminder("2w", ["stretch"], 1, None, fetch_user, 202, 303))
-    too_far = run(reminders.create_reminder(f"{MAX_REMINDER_SECONDS + 1}s", ["stretch"], 1, None, fetch_user, 202, 303))
-    past = run(reminders.create_reminder("0s", ["stretch"], 1, None, fetch_user, 202, 303))
+    unsupported = run(reminders.create_reminder("2w", ["stretch"], 1, 202, 303))
+    too_far = run(reminders.create_reminder(f"{MAX_REMINDER_SECONDS + 1}s", ["stretch"], 1, 202, 303))
+    past = run(reminders.create_reminder("0s", ["stretch"], 1, 202, 303))
 
     assert unsupported == "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"
     assert too_far == "Why are you using this feature for a reminder that far in the future?"
@@ -165,7 +154,7 @@ def test_create_reminder_rejects_invalid_durations_without_persisting(tmp_path: 
 def test_create_reminder_persists_record_and_schedules_timer(tmp_path: Path) -> None:
     reminders = RecordingReminders(tmp_path)
 
-    result = run(reminders.create_reminder("5m", ["check", "laundry"], 1, None, fetch_user, 202, 303))
+    result = run(reminders.create_reminder("5m", ["check", "laundry"], 1, 202, 303, user_name="Alice"))
 
     assert result.startswith("Created reminder for Alice to go off at ")
     assert result.endswith(" that says `check laundry`")
@@ -193,8 +182,6 @@ def test_create_reminder_uses_provided_user_name_without_fetching_user(tmp_path:
             "5m",
             ["check", "laundry"],
             1,
-            None,
-            None,
             202,
             303,
             user_name="Alice From Message",
@@ -205,24 +192,20 @@ def test_create_reminder_uses_provided_user_name_without_fetching_user(tmp_path:
     assert reminders.reminders.reminders[0].name == "Alice From Message"
 
 
-def test_create_reminder_falls_back_to_user_id_when_fetch_user_fails(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_create_reminder_falls_back_to_user_id_when_name_is_unavailable(tmp_path: Path) -> None:
     reminders = RecordingReminders(tmp_path)
 
-    with caplog.at_level(logging.ERROR):
-        result = run(reminders.create_reminder("5m", ["check", "laundry"], 1, None, failing_fetch_user, 202, 303))
+    result = run(reminders.create_reminder("5m", ["check", "laundry"], 1, 202, 303))
 
     assert result.startswith("Created reminder for 1 to go off at ")
     assert reminders.reminders.reminders[0].name == "1"
-    assert "Unable to fetch user 1 for reminder creator name" in caplog.text
 
 
 def test_create_reminder_truncates_message_and_response_to_discord_limit(tmp_path: Path) -> None:
     reminders = RecordingReminders(tmp_path)
     long_message = "a" * (DISCORD_MESSAGE_LIMIT + 50)
 
-    result = run(reminders.create_reminder("5m", [long_message], 1, None, fetch_user, 202, 303))
+    result = run(reminders.create_reminder("5m", [long_message], 1, 202, 303, user_name="Alice"))
 
     assert len(result) == DISCORD_MESSAGE_LIMIT
     assert result.endswith(TRUNCATION_SUFFIX)
@@ -270,7 +253,7 @@ def test_create_reminder_rejects_new_reminders_when_guild_limit_is_reached(tmp_p
             )
         )
 
-    result = run(reminders.create_reminder("5m", ["stretch"], 1, None, fetch_user, 202, 303))
+    result = run(reminders.create_reminder("5m", ["stretch"], 1, 202, 303))
 
     assert result == (
         "Reminder limit reached. Delete or wait for a reminder to complete before creating a new one. Limit: "
@@ -336,3 +319,14 @@ def test_send_message_retries_unavailable_channels_then_removes_reminder(
     assert reminders.saved_count == 1
     assert sleep_calls == [0, REMINDER_DELIVERY_RETRY_DELAY_SECONDS, REMINDER_DELIVERY_RETRY_DELAY_SECONDS]
     assert "failed to send reminder after 3 attempts" in caplog.text
+
+
+def test_close_cancels_pending_timer_tasks(tmp_path: Path) -> None:
+    async def exercise_close() -> tuple[int, int]:
+        reminders = Reminders(SimpleNamespace(id=202, name="Guild"), tmp_path)
+        reminders.create_timer(make_reminder(), 3_600)
+        task_count_before_close = len(reminders._timer_tasks)  # noqa: SLF001
+        await reminders.close()
+        return task_count_before_close, len(reminders._timer_tasks)  # noqa: SLF001
+
+    assert run(exercise_close()) == (1, 0)

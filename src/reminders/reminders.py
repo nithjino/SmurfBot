@@ -7,10 +7,9 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import discord
-import pytz
 from atomicwrites import atomic_write
 
 from discord_messages import send_reminder_response
@@ -27,10 +26,8 @@ from .constants import (
 )
 from .models import DatetimePassedResult, ReminderFile, ReminderRecord
 
-if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
-
 _logger = logging.getLogger(__name__)
+DISPLAY_TIMEZONE = ZoneInfo("America/New_York")
 
 
 def parse_time(time: str) -> int | None:
@@ -102,45 +99,22 @@ def parse_reminder_delay(seconds: str) -> tuple[int | None, str | None]:
     return delay_seconds, None
 
 
-async def resolve_reminder_user_name(
-    user_id: int,
-    user_name: str | None,
-    fetch_user: Callable[[int], Awaitable[discord.User]] | None,
-) -> str:
-    """Return a reminder creator name without requiring a Discord API lookup."""
-    if user_name:
-        return user_name
-
-    if fetch_user is None:
-        _logger.warning("Unable to resolve user name for reminder creator %s; using user ID", user_id)
-        return str(user_id)
-
-    try:
-        user = await fetch_user(user_id)
-    except discord.NotFound, discord.HTTPException:
-        _logger.exception("Unable to fetch user %s for reminder creator name; using user ID", user_id)
-        return str(user_id)
-
-    return user.name
-
-
 class Reminders:
     """Manage persisted reminders and scheduled reminder messages for a guild."""
 
-    def __init__(self, guild: discord.Guild, reminders_json_path: str | Path, client: discord.Client) -> None:
+    def __init__(self, guild: discord.Guild, reminders_json_path: str | Path) -> None:
         """Initialize paths and default reminder state for a guild."""
         self.guild = guild
         self.reminders_json_path = Path(reminders_json_path)
         self.reminders_json_file = self.reminders_json_path / f"{guild.id}.json"
         self.reminders = ReminderFile(name=guild.name, id=guild.id)
-        self.loop = client.loop
         self._timer_tasks: set[asyncio.Task[None]] = set()
         self._reminder_lock = asyncio.Lock()
 
     @classmethod
-    async def create(cls, guild: discord.Guild, reminders_json_path: str | Path, client: discord.Client) -> Reminders:
+    async def create(cls, guild: discord.Guild, reminders_json_path: str | Path) -> Reminders:
         """Create a reminder handler and schedule any pending reminders."""
-        reminder_handler = cls(guild, reminders_json_path, client)
+        reminder_handler = cls(guild, reminders_json_path)
         reminder_handler.reminders = await reminder_handler.load_reminders()
         await reminder_handler.clean_reminders()
         await reminder_handler.parse_reminders()
@@ -148,15 +122,18 @@ class Reminders:
 
     async def create_json(self) -> None:
         """Create the reminders directory and guild JSON file when missing."""
-        if not self.reminders_json_path.exists():
-            self.reminders_json_path.mkdir(parents=True)
-            _logger.info("created %s", self.reminders_json_path)
-        # creates reminders json file for the group if it doesn't exist
-        if not self.reminders_json_file.exists():
+
+        def create_json_sync() -> None:
+            self.reminders_json_path.mkdir(parents=True, exist_ok=True)
             create_json = ReminderFile(name=self.guild.name, id=self.guild.id)
-            with self.reminders_json_file.open("w", encoding="utf-8") as reminders_file:
-                json.dump(create_json.model_dump(mode="json"), reminders_file)
+            try:
+                with self.reminders_json_file.open("x", encoding="utf-8") as reminders_file:
+                    json.dump(create_json.model_dump(mode="json"), reminders_file)
+            except FileExistsError:
+                return
             _logger.info("%s: created: %s", self.guild.name, self.reminders_json_file)
+
+        await asyncio.to_thread(create_json_sync)
 
     async def load_reminders(self) -> ReminderFile:
         """Return the guild's reminders JSON data."""
@@ -180,12 +157,14 @@ class Reminders:
         """Remove expired reminders and persist the cleaned reminder list."""
         _logger.info("%s: cleaning: %s", self.guild.name, self.reminders_json_file)
         async with self._reminder_lock:
-            self.reminders.reminders = [
+            active_reminders = [
                 reminder
                 for reminder in self.reminders.reminders
                 if not has_datetime_passed(reminder.execution_time).result
             ]
-            await self._save_reminders_unlocked()
+            if len(active_reminders) != len(self.reminders.reminders):
+                self.reminders.reminders = active_reminders
+                await self._save_reminders_unlocked()
 
     async def list_reminders(self) -> str:
         """Return a formatted list of active reminders."""
@@ -194,11 +173,8 @@ class Reminders:
             reminders = list(self.reminders.reminders)
         messages: list[str] = []
         for reminder in reminders:
-            reminder_date = reminder.execution_time
-            if isinstance(reminder_date, str):
-                reminder_date = datetime.strptime(reminder_date, DATE_FORMAT).replace(tzinfo=UTC)
-            reminder_date = reminder_date.replace(tzinfo=UTC)
-            display_date = reminder_date.astimezone(pytz.timezone("US/Eastern")).strftime(HUMAN_DATE_FORMAT)
+            reminder_date = datetime.strptime(reminder.execution_time, DATE_FORMAT).replace(tzinfo=UTC)
+            display_date = reminder_date.astimezone(DISPLAY_TIMEZONE).strftime(HUMAN_DATE_FORMAT)
             messages.append(
                 f"\nCreated by: {reminder.name}\nReminder date: {display_date}\nReminder message: {reminder.message}\n"
             )
@@ -220,7 +196,7 @@ class Reminders:
         _logger.info("%s: parse_reminder()", self.guild.name)
         passed_result = has_datetime_passed(reminder.execution_time)
         if not passed_result.result:
-            await self.create_timer(reminder, passed_result.seconds_until_execution)
+            self.create_timer(reminder, passed_result.seconds_until_execution)
         else:
             _logger.info(
                 "%s: parse_reminder() - reminder for %s that says %s alredy expired",
@@ -229,21 +205,38 @@ class Reminders:
                 reminder.message,
             )
 
-    async def create_timer(
+    def create_timer(
         self,
         reminder: ReminderRecord,
         delay_seconds: float,
     ) -> None:
         """Create an async timer that sends a reminder message later."""
-        task = self.loop.create_task(self.send_message(reminder, delay_seconds))
+        task = asyncio.create_task(self.send_message(reminder, delay_seconds))
         self._timer_tasks.add(task)
-        task.add_done_callback(self._timer_tasks.discard)
+        task.add_done_callback(self._timer_finished)
         _logger.info(
             "%s: created timer for %s that will execute in %s seconds",
             self.guild.name,
             reminder.name,
             delay_seconds,
         )
+
+    def _timer_finished(self, task: asyncio.Task[None]) -> None:
+        """Remove a finished timer task and report unexpected failures."""
+        self._timer_tasks.discard(task)
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            _logger.error("%s: reminder timer failed", self.guild.name, exc_info=exception)
+
+    async def close(self) -> None:
+        """Cancel and await all scheduled timers owned by this guild handler."""
+        tasks = tuple(self._timer_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def remove_reminder(self, reminder: ReminderRecord) -> None:
         """Remove a completed reminder from memory and disk."""
@@ -309,9 +302,7 @@ class Reminders:
         seconds: str,
         message: list[str],
         user_id: int,
-        _created_at: datetime | None,
-        fetch_user: Callable[[int], Awaitable[discord.User]] | None,
-        guild_id: int | None,
+        guild_id: int,
         channel_id: int,
         user_name: str | None = None,
     ) -> str:
@@ -333,7 +324,7 @@ class Reminders:
             return error_message
         reminder_message = truncate_text(" ".join(message), DISCORD_MESSAGE_LIMIT)
         created_at = datetime.now(UTC)
-        reminder_user_name = await resolve_reminder_user_name(user_id, user_name, fetch_user)
+        reminder_user_name = user_name or str(user_id)
         reminder = ReminderRecord(
             user_id=user_id,
             name=reminder_user_name,
@@ -353,11 +344,9 @@ class Reminders:
             self.reminders.reminders.append(reminder)
             await self._save_reminders_unlocked()
         execution_time = (
-            (created_at + timedelta(seconds=delay_seconds))
-            .astimezone(pytz.timezone("US/Eastern"))
-            .strftime(HUMAN_DATE_FORMAT)
+            (created_at + timedelta(seconds=delay_seconds)).astimezone(DISPLAY_TIMEZONE).strftime(HUMAN_DATE_FORMAT)
         )
-        await self.create_timer(reminder, delay_seconds)
+        self.create_timer(reminder, delay_seconds)
         return truncate_discord_message(
             f"Created reminder for {reminder_user_name} to go off at {execution_time} that says `{reminder_message}`"
         )

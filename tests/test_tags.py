@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from message_limits import DISCORD_MESSAGE_LIMIT, TRUNCATION_SUFFIX
+from models import CommandParameters
 from tags.models import TagContent, TagRecord
 from tags.tags import MAX_TAGS_PER_GUILD, Tags
 
@@ -22,6 +24,18 @@ def run[T](coro: Coroutine[object, object, T]) -> T:
 
 def make_tags(tmp_path: Path) -> Tags:
     return Tags(SimpleNamespace(id=101, name="Guild"), tmp_path)
+
+
+def make_parameters(message: list[str]) -> CommandParameters:
+    return CommandParameters(
+        command="tag",
+        message=message,
+        created_at=datetime.now(UTC),
+        author_id=7,
+        author_name="Alice",
+        guild_id=101,
+        channel_id=202,
+    )
 
 
 def test_create_tag_uses_attachment_or_text_and_persists(tmp_path: Path) -> None:
@@ -79,12 +93,11 @@ def test_create_and_rename_reject_reserved_command_names(tmp_path: Path) -> None
 def test_parse_commands_routes_known_handlers_and_posts_unknown_tags(tmp_path: Path) -> None:
     tags = make_tags(tmp_path)
     tags.tags.tags["launch"] = TagRecord(owner=7, content="go now")
-    base_parameters = {"author_id": 7, "attachment": None, "fetch_user_func": None}
 
-    assert run(tags.parse_commands({**base_parameters, "message": []})).startswith("To create a tag")
-    assert run(tags.parse_commands({**base_parameters, "message": ["list"]})) == "launch"
-    assert run(tags.parse_commands({**base_parameters, "message": ["launch"]})) == "go now"
-    assert run(tags.parse_commands({**base_parameters, "message": ["missing"]})) == 'The tag "missing" does not exist'
+    assert run(tags.parse_commands(make_parameters([]))).startswith("To create a tag")
+    assert run(tags.parse_commands(make_parameters(["list"]))) == "launch"
+    assert run(tags.parse_commands(make_parameters(["launch"]))) == "go now"
+    assert run(tags.parse_commands(make_parameters(["missing"]))) == 'The tag "missing" does not exist'
 
 
 def test_create_and_edit_tag_truncate_content_to_discord_limit(tmp_path: Path) -> None:

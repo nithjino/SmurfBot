@@ -116,3 +116,19 @@ def test_extract_secret_value_supports_vault_kv_v1_and_kv_v2_payloads() -> None:
     assert extract_secret_value({"data": {"discord_token": "kv1-token"}}, "discord_token") == "kv1-token"
     assert extract_secret_value({"data": {"data": {"discord_token": "kv2-token"}}}, "discord_token") == "kv2-token"
     assert extract_secret_value({"data": {"other_key": "missing"}}, "discord_token") is None
+
+
+def test_vault_url_requires_https_except_for_private_networks_and_loopback() -> None:
+    configured_value = "test-value"
+    secure = VaultSettings(vault_url="https://vault.example.com", vault_token=configured_value)
+    loopback = VaultSettings(vault_url="http://127.0.0.1:8200", vault_token=configured_value)
+    private_network = VaultSettings(vault_url="http://192.168.2.10:8200", vault_token=configured_value)
+
+    assert secure.url == "https://vault.example.com"
+    assert loopback.url == "http://127.0.0.1:8200"
+    assert private_network.url == "http://192.168.2.10:8200"
+
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        VaultSettings(vault_url="http://vault.example.com", vault_token=configured_value)
+    with pytest.raises(ValueError, match="must not contain credentials"):
+        VaultSettings(vault_url="https://user:password@vault.example.com", vault_token=configured_value)

@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
     import discord
 
+    from models import FetchUser
     from reminders import Reminders
     from tags import Tags
 
@@ -43,7 +44,7 @@ async def parse_tag_commands(parameters: CommandParameters) -> str:
     tag = tags.get(guild_id)
     if tag is None:
         return "unable to get tag. tag function parameter is None"
-    return await tag.parse_commands(parameters.model_dump())
+    return await tag.parse_commands(parameters)
 
 
 async def parse_remind_commands(parameters: CommandParameters) -> str:
@@ -59,8 +60,6 @@ async def parse_remind_commands(parameters: CommandParameters) -> str:
     command_message = parameters.message
     time = command_message[0] if command_message else "help"
     message = command_message[1:]
-    fetch_user_func = parameters.fetch_user_func
-    created_at = None
     user = parameters.author_id
     if len(command_message) < MIN_REMIND_ARGUMENTS:
         time = "help"
@@ -68,8 +67,6 @@ async def parse_remind_commands(parameters: CommandParameters) -> str:
         time,
         message,
         user,
-        created_at,
-        fetch_user_func,
         guild_id,
         channel_id,
         user_name=parameters.author_name,
@@ -84,18 +81,17 @@ async def mock(parameters: CommandParameters | str) -> str:
     else:
         message = " ".join(parameters.message).lower().strip()
 
-    result = ""
-    for index, character in enumerate(message):
+    result: list[str] = []
+    uppercase = True
+    for character in message:
         if character.isspace():
-            result = result + " "
+            result.append(character)
             continue
 
-        previous_character_is_upper = (
-            index > 0 and result[-2].isupper() if message[index - 1].isspace() else index > 0 and result[-1].isupper()
-        )
-        result += character if previous_character_is_upper else character.upper()
+        result.append(character.upper() if uppercase else character)
+        uppercase = not uppercase
 
-    return result
+    return "".join(result)
 
 
 async def git(_parameters: CommandParameters | None = None) -> str:
@@ -108,26 +104,21 @@ def build_command_parameters(
     message: discord.Message,
     user_command: str,
     command_message: list[str],
-    fetch_user_func: object | None = None,
+    fetch_user_func: FetchUser | None = None,
 ) -> CommandParameters:
     """Build command context from an incoming Discord message."""
-    parameters = CommandParameters(
+    is_owner_lookup = user_command == "tag" and bool(command_message) and command_message[0] == "owner"
+    return CommandParameters(
         command=user_command,
         message=command_message,
+        attachment=message.attachments[0].url if message.attachments else None,
+        fetch_user_func=fetch_user_func if is_owner_lookup else None,
         created_at=message.created_at,
         author_id=message.author.id,
         author_name=message.author.name,
         guild_id=message.guild.id if message.guild else None,
         channel_id=message.channel.id,
     )
-    if message.attachments:
-        parameters.attachment = message.attachments[0].url
-
-    is_owner_lookup = parameters.command == "tag" and bool(parameters.message) and parameters.message[0] == "owner"
-    if is_owner_lookup:
-        parameters.fetch_user_func = fetch_user_func
-
-    return parameters
 
 
 valid_commands: Final[dict[str, Callable[[CommandParameters], Awaitable[str]]]] = {

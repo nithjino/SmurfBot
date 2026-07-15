@@ -42,7 +42,12 @@ from command_handlers import (
 )
 from command_handlers import build_command_parameters as _build_command_parameters
 from discord_messages import send_command_response
-from guild_handlers import initialize_guild_handlers as _initialize_guild_handlers
+from guild_handlers import (
+    initialize_guild_handlers as _initialize_guild_handlers,
+)
+from guild_handlers import (
+    remove_guild_handlers as _remove_guild_handlers,
+)
 from reminders import Reminders
 from settings import Settings, load_settings
 from tags import Tags
@@ -89,6 +94,7 @@ __all__ = [
     "main",
     "mock",
     "on_guild_join",
+    "on_guild_remove",
     "on_message",
     "on_ready",
     "parse_remind_commands",
@@ -155,7 +161,6 @@ async def initialize_guild_handlers(
         guild,
         tag_json_path,
         reminders_json_path,
-        client,
         tags,
         reminders,
         Tags,
@@ -216,9 +221,15 @@ async def on_guild_join(guild: discord.Guild) -> None:
 
 
 @client.event
+async def on_guild_remove(guild: discord.Guild) -> None:
+    """Discard guild state and cancel its pending in-process reminder tasks."""
+    await _remove_guild_handlers(guild.id, tags, reminders)
+
+
+@client.event
 async def on_message(message: discord.Message) -> None:
     """Parse incoming Discord messages and dispatch supported bot commands."""
-    if message.author == client.user:
+    if message.author == client.user or getattr(message.author, "bot", False):
         return
 
     command_delimiter = get_command_delimiter()

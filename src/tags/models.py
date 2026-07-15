@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+from pydantic import BaseModel, ConfigDict, Field
 
-from pydantic import BaseModel, Field
+
+class PersistedTagModel(BaseModel):
+    """Base configuration for validated tag state."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
 class TagContent(BaseModel):
@@ -14,25 +18,16 @@ class TagContent(BaseModel):
     attachment: str | None
 
 
-class TagRecord(BaseModel):
+class TagRecord(PersistedTagModel):
     """Persisted tag data."""
 
     owner: int
     content: str
 
 
-class TagFile(BaseModel):
+class TagFile(PersistedTagModel):
     """Persisted guild tag file."""
 
     name: str
     id: int
     tags: dict[str, TagRecord] = Field(default_factory=dict)
-
-
-class TagCommandParameters(BaseModel):
-    """Command context needed by tag operations."""
-
-    message: list[str]
-    attachment: str | None = None
-    author_id: int
-    fetch_user_func: Any = None

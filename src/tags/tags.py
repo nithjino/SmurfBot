@@ -14,10 +14,12 @@ from atomicwrites import atomic_write
 from message_limits import DISCORD_MESSAGE_LIMIT, truncate_discord_message, truncate_text
 
 from .handlers import TAG_COMMAND_HANDLERS
-from .models import TagCommandParameters, TagContent, TagFile, TagRecord
+from .models import TagContent, TagFile, TagRecord
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
+
+    from models import CommandParameters
 
 _logger = logging.getLogger(__name__)
 
@@ -60,15 +62,18 @@ class Tags:
 
     async def create_json(self) -> None:
         """Create the tags directory and guild JSON file when missing."""
-        if not self.tags_json_path.exists():
-            self.tags_json_path.mkdir(parents=True)
-            _logger.info("created %s", self.tags_json_path)
-        # creates tag json file for the group if it doesn't exist
-        if not self.tags_json_file.exists():
+
+        def create_json_sync() -> None:
+            self.tags_json_path.mkdir(parents=True, exist_ok=True)
             create_json = TagFile(name=self.guild.name, id=self.guild.id)
-            with self.tags_json_file.open("w", encoding="utf-8") as tags_file:
-                json.dump(create_json.model_dump(mode="json"), tags_file)
+            try:
+                with self.tags_json_file.open("x", encoding="utf-8") as tags_file:
+                    json.dump(create_json.model_dump(mode="json"), tags_file)
+            except FileExistsError:
+                return
             _logger.info("%s: created: %s", self.guild.name, self.tags_json_file)
+
+        await asyncio.to_thread(create_json_sync)
 
     async def load_tags(self) -> TagFile:
         """Return the guild's tag JSON data."""
@@ -88,9 +93,8 @@ class Tags:
         with atomic_write(self.tags_json_file, overwrite=True, encoding="utf-8") as tag_file:
             tag_file.write(json.dumps(self.tags.model_dump(mode="json"), sort_keys=True, indent=2))
 
-    async def parse_commands(self, parameters: object) -> str:
+    async def parse_commands(self, parameters: CommandParameters) -> str:
         """Dispatch a tag subcommand using parsed message parameters."""
-        parameters = TagCommandParameters.model_validate(parameters)
         _logger.info("tags parse_commands parameters: %s", parameters)
         if not parameters.message:
             return await self.post_help()

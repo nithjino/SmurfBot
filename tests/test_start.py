@@ -188,8 +188,8 @@ def test_initialize_guild_handlers_skips_bad_tag_file_without_replacing_it(
 
     class RecordingReminders:
         @classmethod
-        async def create(cls, guild: object, reminders_json_path: Path, discord_client: object) -> SimpleNamespace:
-            return SimpleNamespace(guild=guild, reminders_json_path=reminders_json_path, discord_client=discord_client)
+        async def create(cls, guild: object, reminders_json_path: Path) -> SimpleNamespace:
+            return SimpleNamespace(guild=guild, reminders_json_path=reminders_json_path)
 
     monkeypatch.setattr(start, "Reminders", RecordingReminders)
     start.tags.clear()
@@ -245,6 +245,78 @@ def test_on_guild_join_initializes_joined_guild(tmp_path: Path, monkeypatch: pyt
     run(start.on_guild_join(guild))
 
     assert calls == [(guild, configured_data_dir / "tags", configured_data_dir / "reminders")]
+
+
+def test_initialize_guild_handlers_is_idempotent_during_concurrent_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    create_counts = {"tags": 0, "reminders": 0}
+
+    class RecordingTags:
+        @classmethod
+        async def create(cls, guild: object, tags_json_path: Path) -> SimpleNamespace:
+            create_counts["tags"] += 1
+            await asyncio.sleep(0)
+            return SimpleNamespace(guild=guild, tags_json_path=tags_json_path)
+
+    class RecordingReminders:
+        @classmethod
+        async def create(cls, guild: object, reminders_json_path: Path) -> SimpleNamespace:
+            create_counts["reminders"] += 1
+            await asyncio.sleep(0)
+            return SimpleNamespace(guild=guild, reminders_json_path=reminders_json_path)
+
+    async def initialize_twice() -> None:
+        guild = SimpleNamespace(id=404, name="Guild")
+        await asyncio.gather(
+            initialize_guild_handlers(guild, tmp_path / "tags", tmp_path / "reminders"),
+            initialize_guild_handlers(guild, tmp_path / "tags", tmp_path / "reminders"),
+        )
+
+    monkeypatch.setattr(start, "Tags", RecordingTags)
+    monkeypatch.setattr(start, "Reminders", RecordingReminders)
+    start.tags.clear()
+    start.reminders.clear()
+
+    run(initialize_twice())
+
+    assert create_counts == {"tags": 1, "reminders": 1}
+
+
+def test_on_guild_remove_cancels_reminders_and_discards_state() -> None:
+    class RecordingReminders:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    guild = SimpleNamespace(id=505, name="Removed Guild")
+    reminder_handler = RecordingReminders()
+    start.tags[guild.id] = SimpleNamespace()
+    start.reminders[guild.id] = reminder_handler
+
+    run(start.on_guild_remove(guild))
+
+    assert guild.id not in start.tags
+    assert guild.id not in start.reminders
+    assert reminder_handler.closed is True
+
+
+def test_on_message_ignores_other_bots(monkeypatch: pytest.MonkeyPatch) -> None:
+    dispatched = False
+
+    async def command(_parameters: CommandParameters) -> str:
+        nonlocal dispatched
+        dispatched = True
+        return "should not run"
+
+    message = SimpleNamespace(content="$ping", author=SimpleNamespace(id=123, name="Bot", bot=True))
+    monkeypatch.setitem(start.valid_commands, "ping", command)
+
+    run(start.on_message(message))
+
+    assert dispatched is False
 
 
 def test_on_message_sends_generic_response_when_command_handler_fails(

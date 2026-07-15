@@ -35,6 +35,8 @@ SMURFBOT_DISCORD_TOKEN=your_discord_bot_token
 ```
 
 If `SMURFBOT_DISCORD_TOKEN` is not set, the bot reads the Discord token from Vault. Set `HASHICORP_VAULT_URL` or `SMURFBOT_VAULT_URL`, plus one Vault auth token variable: `HASHICORP_VAULT_TOKEN`, `SMURFBOT_VAULT_TOKEN`, or `VAULT_TOKEN`.
+Remote Vault URLs must use HTTPS. Plain HTTP is accepted for literal private-network and loopback IP addresses,
+such as `http://192.168.2.10:8200`, to support local Vault installations.
 
 ## Docker
 

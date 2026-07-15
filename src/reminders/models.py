@@ -2,32 +2,39 @@
 
 from __future__ import annotations
 
-from datetime import datetime  # noqa: TC003
+from dataclasses import dataclass
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
-class DatetimePassedResult(BaseModel):
+@dataclass(frozen=True, slots=True)
+class DatetimePassedResult:
     """Result of comparing a planned execution time with now."""
 
     result: bool
     seconds_until_execution: float
 
 
-class ReminderRecord(BaseModel):
+class PersistedReminderModel(BaseModel):
+    """Base configuration for validated reminder state."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+
+class ReminderRecord(PersistedReminderModel):
     """Persisted reminder data."""
 
     user_id: int
     name: str
     message: str
     created_at: str
-    execution_time: str | datetime
+    execution_time: str
     timezone: str
-    guild_id: int | None
+    guild_id: int
     channel_id: int
 
 
-class ReminderFile(BaseModel):
+class ReminderFile(PersistedReminderModel):
     """Persisted guild reminder file."""
 
     name: str

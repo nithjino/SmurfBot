@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from typing import Any, Final
+from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
+from typing import Final
 from urllib import error, request
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
@@ -17,6 +19,11 @@ HASHICORP_VAULT_URL_ENV_VAR: Final[str] = "HASHICORP_VAULT_URL"
 HASHICORP_VAULT_TOKEN_ENV_VAR: Final[str] = "HASHICORP_VAULT_TOKEN"  # noqa: S105
 VAULT_ADDR_ENV_VAR: Final[str] = "VAULT_ADDR"
 VAULT_TOKEN_ENV_VAR: Final[str] = "VAULT_TOKEN"  # noqa: S105
+MAX_VAULT_RESPONSE_BYTES: Final[int] = 1_048_576
+LOCAL_VAULT_HOSTNAMES: Final[frozenset[str]] = frozenset({"localhost"})
+PRIVATE_VAULT_NETWORKS: Final[tuple[IPv4Network | IPv6Network, ...]] = tuple(
+    ip_network(cidr) for cidr in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
+)
 SETTINGS_ENV_FIELDS: Final[tuple[str, ...]] = (
     "delim",
     "consume_time",
@@ -81,7 +88,7 @@ class VaultSettings(BaseModel):
     token: SecretStr = Field(alias="vault_token")
     discord_token_path: str = Field(default=DEFAULT_VAULT_DISCORD_TOKEN_PATH, alias="vault_token_path")
 
-    @field_validator("url", "discord_token_path")
+    @field_validator("discord_token_path")
     @classmethod
     def validate_non_empty_string(cls, value: str) -> str:
         """Require non-empty Vault connection values."""
@@ -89,6 +96,21 @@ class VaultSettings(BaseModel):
             msg = "Vault settings must not be empty"
             raise ValueError(msg)
         return value
+
+    @field_validator("url")
+    @classmethod
+    def validate_vault_url(cls, value: str) -> str:
+        """Require HTTPS except for Vault servers addressed by a local IP."""
+        parsed_url = urlsplit(value)
+        if parsed_url.username is not None or parsed_url.password is not None:
+            msg = "Vault URL must not contain credentials"
+            raise ValueError(msg)
+        if parsed_url.scheme == "https" and parsed_url.hostname:
+            return value
+        if parsed_url.scheme == "http" and is_local_vault_host(parsed_url.hostname):
+            return value
+        msg = "Vault URL must use HTTPS; HTTP is allowed only for private-network or loopback IP addresses"
+        raise ValueError(msg)
 
     @field_validator("token")
     @classmethod
@@ -98,6 +120,19 @@ class VaultSettings(BaseModel):
             msg = "vault_token must not be empty"
             raise ValueError(msg)
         return value
+
+
+def is_local_vault_host(hostname: str | None) -> bool:
+    """Return whether a Vault hostname is localhost, loopback, or a private IP address."""
+    if hostname in LOCAL_VAULT_HOSTNAMES:
+        return True
+    if hostname is None:
+        return False
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        return False
+    return address.is_loopback or any(address in network for network in PRIVATE_VAULT_NETWORKS)
 
 
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
@@ -152,7 +187,22 @@ def fetch_discord_token_from_vault(
     return discord_token
 
 
-def read_vault_secret(vault_settings: VaultSettings) -> Mapping[str, Any]:
+class NoRedirectHandler(request.HTTPRedirectHandler):
+    """Prevent Vault credentials from being forwarded through HTTP redirects."""
+
+    def redirect_request(
+        self,
+        req: request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> None:
+        """Reject redirects instead of constructing a follow-up request."""
+
+
+def read_vault_secret(vault_settings: VaultSettings) -> Mapping[str, object]:
     """Read a secret from Vault's HTTP API."""
     vault_url = vault_settings.url.rstrip("/")
     vault_path = vault_settings.discord_token_path.lstrip("/")
@@ -160,12 +210,18 @@ def read_vault_secret(vault_settings: VaultSettings) -> Mapping[str, Any]:
         f"{vault_url}/v1/{vault_path}",
         headers={"X-Vault-Token": vault_settings.token.get_secret_value()},
     )
+    opener = request.build_opener(NoRedirectHandler())
     try:
-        with request.urlopen(vault_request, timeout=10) as response:  # noqa: S310
-            payload = json.loads(response.read().decode("utf-8"))
+        with opener.open(vault_request, timeout=10) as response:
+            response_body = response.read(MAX_VAULT_RESPONSE_BYTES + 1)
     except (TimeoutError, error.HTTPError, error.URLError) as exc:
         msg = f"Failed to read Discord token from Vault path {vault_settings.discord_token_path!r}"
         raise RuntimeError(msg) from exc
+
+    if len(response_body) > MAX_VAULT_RESPONSE_BYTES:
+        msg = f"Vault path {vault_settings.discord_token_path!r} returned an oversized response"
+        raise RuntimeError(msg)
+    payload: object = json.loads(response_body.decode("utf-8"))
 
     if not isinstance(payload, Mapping):
         msg = f"Vault path {vault_settings.discord_token_path!r} returned a non-object response"
@@ -173,7 +229,7 @@ def read_vault_secret(vault_settings: VaultSettings) -> Mapping[str, Any]:
     return payload
 
 
-def extract_secret_value(vault_response: Mapping[str, Any], key: str) -> str | None:
+def extract_secret_value(vault_response: Mapping[str, object], key: str) -> str | None:
     """Return a secret value from Vault KV v1 or KV v2 response data."""
     data = vault_response.get("data")
     if not isinstance(data, Mapping):

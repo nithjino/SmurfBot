@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from models import CommandParameters
 from tags.handlers import handle_gift, parse_discord_user_id
-from tags.models import TagCommandParameters
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -38,7 +39,15 @@ def test_handle_gift_validates_new_owner_before_changing_state() -> None:
             return "gifted"
 
     tags = FakeTags()
-    parameters = TagCommandParameters(message=["gift", "launch"], author_id=7)
+    parameters = CommandParameters(
+        command="tag",
+        message=["gift", "launch"],
+        created_at=datetime.now(UTC),
+        author_id=7,
+        author_name="Alice",
+        guild_id=1,
+        channel_id=2,
+    )
 
     invalid_result = run(handle_gift(tags, parameters, ["launch", "not-a-user"]))
     valid_result = run(handle_gift(tags, parameters, ["launch", "<@!42>"]))
