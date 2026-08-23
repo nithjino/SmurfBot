@@ -459,6 +459,18 @@ def test_command_substitutions_replace_builtins_and_are_copied_during_constructi
     assert sent_text(channel) == ["first"]
 
 
+def test_uppercase_only_command_substitution_does_not_replace_lowercase_builtin(tmp_path: Path) -> None:
+    async def replacement(_parameters: CommandParameters) -> str:
+        return "replacement"
+
+    runtime, _client, _factories = make_runtime(tmp_path, substitutions={"PING": replacement})
+    channel = RecordingChannel()
+
+    run(runtime.on_message(make_message("$PING", channel=channel)))
+
+    assert sent_text(channel) == ["pong"]
+
+
 def test_tag_owner_command_receives_client_user_lookup(tmp_path: Path) -> None:
     guild = make_guild(909)
     runtime, client, factories = make_runtime(tmp_path, client=FakeClient(guilds=[guild]))
@@ -589,6 +601,64 @@ def test_cancelled_command_is_not_translated_to_generic_error(tmp_path: Path) ->
 
     with pytest.raises(asyncio.CancelledError):
         run(runtime.on_message(make_message("$cancel")))
+
+
+def test_cancelled_factory_is_not_swallowed_as_partial_initialization(tmp_path: Path) -> None:
+    guild = make_guild()
+    factories = RecordingFactories()
+
+    async def cancel_tag(_guild: object, _path: Path) -> RecordingTag:
+        raise asyncio.CancelledError
+
+    runtime = BotRuntime(
+        FakeClient(guilds=[guild]),
+        command_delimiter="$",
+        data_dir=tmp_path,
+        _dependencies=_RuntimeDependencies(tag_factory=cancel_tag, reminder_factory=factories.make_reminder),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        run(runtime.on_ready())
+
+    assert factories.reminder_calls == []
+
+
+def test_cancelled_response_send_is_not_swallowed(tmp_path: Path) -> None:
+    class CancellingChannel(RecordingChannel):
+        async def send(self, _content: str, **_kwargs: object) -> None:
+            raise asyncio.CancelledError
+
+    runtime, _client, _factories = make_runtime(tmp_path)
+
+    with pytest.raises(asyncio.CancelledError):
+        run(runtime.on_message(make_message("$ping", channel=CancellingChannel())))
+
+
+def test_cancelled_reminder_close_propagates_after_registry_removal(tmp_path: Path) -> None:
+    guild = make_guild()
+
+    class CancellingReminder(RecordingReminder):
+        async def close(self) -> None:
+            raise asyncio.CancelledError
+
+    async def make_reminder(_guild: object, _path: Path) -> CancellingReminder:
+        return CancellingReminder()
+
+    factories = RecordingFactories()
+    runtime = BotRuntime(
+        FakeClient(guilds=[guild]),
+        command_delimiter="$",
+        data_dir=tmp_path,
+        _dependencies=_RuntimeDependencies(tag_factory=factories.make_tag, reminder_factory=make_reminder),
+    )
+    run(runtime.on_ready())
+
+    with pytest.raises(asyncio.CancelledError):
+        run(runtime.on_guild_remove(guild))
+
+    channel = RecordingChannel()
+    run(runtime.on_message(make_message("$tag launch", guild=guild, channel=channel)))
+    assert sent_text(channel) == ["unable to get tag. tag function parameter is None"]
 
 
 @pytest.mark.parametrize("bad_registry", ["tags", "reminders"])

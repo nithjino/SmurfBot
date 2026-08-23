@@ -102,3 +102,21 @@ def test_group_helpers_accept_an_explicit_groups_path(tmp_path: Path, monkeypatc
     assert run(is_message_group_enabled(message, explicit_path)) is False
     assert explicit_path.exists()
     assert not (environment_path / "groups.json").exists()
+
+
+def test_group_helpers_default_to_the_environment_data_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    message = SimpleNamespace(
+        author=SimpleNamespace(guild_permissions=SimpleNamespace(administrator=True)),
+        guild=SimpleNamespace(id=303, name="Environment Guild"),
+        channel=SimpleNamespace(id=404),
+    )
+
+    assert run(set_message_group_enabled(message, enabled=False)) == "Environment Guild has been deactived."
+    assert run(is_message_group_enabled(message)) is False
+    assert json.loads((tmp_path / "groups.json").read_text(encoding="utf-8")) == {
+        "Environment Guild": {"enabled": False, "id": "303"}
+    }
