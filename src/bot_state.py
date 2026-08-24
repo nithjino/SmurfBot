@@ -177,10 +177,10 @@ async def sync_group_records(
         await save_group_records(records, groups_path)
 
 
-async def is_message_group_enabled(message: MessageContext) -> bool:
+async def is_message_group_enabled(message: MessageContext, groups_path: Path | None = None) -> bool:
     """Return whether the message context is enabled for bot command responses."""
     name, group_id = get_message_group_name_and_id(message)
-    groups_path = get_groups_path()
+    groups_path = groups_path or get_groups_path()
     records = await load_group_records(groups_path)
     changed = upsert_group_record(records, name, group_id)
     enabled = next(
@@ -200,13 +200,18 @@ def can_manage_group_state(message: MessageContext) -> bool:
     return bool(getattr(permissions, "administrator", False) or getattr(permissions, "manage_guild", False))
 
 
-async def set_message_group_enabled(message: MessageContext, *, enabled: bool) -> str:
+async def set_message_group_enabled(
+    message: MessageContext,
+    *,
+    enabled: bool,
+    groups_path: Path | None = None,
+) -> str:
     """Enable or disable command responses for the current Discord context."""
     if not can_manage_group_state(message):
         return "Only server admins can activate or deactive this bot."
 
     name, group_id = get_message_group_name_and_id(message)
-    groups_path = get_groups_path()
+    groups_path = groups_path or get_groups_path()
     records = await load_group_records(groups_path)
     upsert_group_record(records, name, group_id)
     for record in records.values():
