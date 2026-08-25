@@ -8,17 +8,18 @@ from collections.abc import Mapping
 from ipaddress import IPv4Network, IPv6Network, ip_address, ip_network
 from typing import Final
 from urllib import error, request
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 ENV_PREFIX: Final[str] = "SMURFBOT_"
 DEFAULT_VAULT_DISCORD_TOKEN_PATH: Final[str] = "smurfbot/data/tokens"  # noqa: S105
 DEFAULT_VAULT_DISCORD_TOKEN_KEY: Final[str] = "discord_token"  # noqa: S105
+DEFAULT_VAULT_USERPASS_MOUNT: Final[str] = "userpass"
 HASHICORP_VAULT_URL_ENV_VAR: Final[str] = "HASHICORP_VAULT_URL"
-HASHICORP_VAULT_TOKEN_ENV_VAR: Final[str] = "HASHICORP_VAULT_TOKEN"  # noqa: S105
+HASHICORP_VAULT_USERNAME_ENV_VAR: Final[str] = "HASHICORP_VAULT_USERNAME"
+HASHICORP_VAULT_PASSWORD_ENV_VAR: Final[str] = "HASHICORP_VAULT_PASSWORD"  # noqa: S105
 VAULT_ADDR_ENV_VAR: Final[str] = "VAULT_ADDR"
-VAULT_TOKEN_ENV_VAR: Final[str] = "VAULT_TOKEN"  # noqa: S105
 MAX_VAULT_RESPONSE_BYTES: Final[int] = 1_048_576
 LOCAL_VAULT_HOSTNAMES: Final[frozenset[str]] = frozenset({"localhost"})
 PRIVATE_VAULT_NETWORKS: Final[tuple[IPv4Network | IPv6Network, ...]] = tuple(
@@ -85,10 +86,12 @@ class VaultSettings(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True, populate_by_name=True)
 
     url: str = Field(alias="vault_url")
-    token: SecretStr = Field(alias="vault_token")
+    username: str = Field(alias="vault_username")
+    password: SecretStr = Field(alias="vault_password")
+    userpass_mount: str = Field(default=DEFAULT_VAULT_USERPASS_MOUNT, alias="vault_userpass_mount")
     discord_token_path: str = Field(default=DEFAULT_VAULT_DISCORD_TOKEN_PATH, alias="vault_token_path")
 
-    @field_validator("discord_token_path")
+    @field_validator("username", "userpass_mount", "discord_token_path")
     @classmethod
     def validate_non_empty_string(cls, value: str) -> str:
         """Require non-empty Vault connection values."""
@@ -112,12 +115,12 @@ class VaultSettings(BaseModel):
         msg = "Vault URL must use HTTPS; HTTP is allowed only for private-network or loopback IP addresses"
         raise ValueError(msg)
 
-    @field_validator("token")
+    @field_validator("password")
     @classmethod
-    def validate_vault_token(cls, value: SecretStr) -> SecretStr:
-        """Require a token for authenticated Vault reads."""
+    def validate_vault_password(cls, value: SecretStr) -> SecretStr:
+        """Require a password for Vault userpass authentication."""
         if not value.get_secret_value():
-            msg = "vault_token must not be empty"
+            msg = "vault_password must not be empty"
             raise ValueError(msg)
         return value
 
@@ -164,20 +167,23 @@ def fetch_discord_token_from_vault(
         msg = "SMURFBOT_DISCORD_TOKEN is not set, so SMURFBOT_VAULT_URL or HASHICORP_VAULT_URL is required"
         raise RuntimeError(msg)
 
-    vault_token = (
-        smurfbot_values.get("vault_token")
-        or environ.get(HASHICORP_VAULT_TOKEN_ENV_VAR)
-        or environ.get(VAULT_TOKEN_ENV_VAR)
-    )
-    if not vault_token:
+    vault_username = smurfbot_values.get("vault_username") or environ.get(HASHICORP_VAULT_USERNAME_ENV_VAR)
+    vault_password = smurfbot_values.get("vault_password") or environ.get(HASHICORP_VAULT_PASSWORD_ENV_VAR)
+    if not vault_username or not vault_password:
         msg = (
-            "SMURFBOT_DISCORD_TOKEN is not set, so SMURFBOT_VAULT_TOKEN, "
-            "HASHICORP_VAULT_TOKEN, or VAULT_TOKEN is required"
+            "SMURFBOT_DISCORD_TOKEN is not set, so a Vault username and password are required via "
+            "SMURFBOT_VAULT_USERNAME and SMURFBOT_VAULT_PASSWORD, or "
+            "HASHICORP_VAULT_USERNAME and HASHICORP_VAULT_PASSWORD"
         )
         raise RuntimeError(msg)
 
     vault_settings = VaultSettings.model_validate(
-        {**smurfbot_values, "vault_url": vault_url, "vault_token": vault_token}
+        {
+            **smurfbot_values,
+            "vault_url": vault_url,
+            "vault_username": vault_username,
+            "vault_password": vault_password,
+        }
     )
     vault_response = read_vault_secret(vault_settings)
     discord_token = extract_secret_value(vault_response, DEFAULT_VAULT_DISCORD_TOKEN_KEY)
@@ -203,28 +209,74 @@ class NoRedirectHandler(request.HTTPRedirectHandler):
 
 
 def read_vault_secret(vault_settings: VaultSettings) -> Mapping[str, object]:
-    """Read a secret from Vault's HTTP API."""
+    """Authenticate with Vault userpass and read a secret from the HTTP API."""
     vault_url = vault_settings.url.rstrip("/")
     vault_path = vault_settings.discord_token_path.lstrip("/")
+    vault_token = authenticate_vault_userpass(vault_settings)
     vault_request = request.Request(  # noqa: S310
         f"{vault_url}/v1/{vault_path}",
-        headers={"X-Vault-Token": vault_settings.token.get_secret_value()},
+        headers={"X-Vault-Token": vault_token.get_secret_value()},
     )
+    return send_vault_request(
+        vault_request,
+        failure_message=f"Failed to read Discord token from Vault path {vault_settings.discord_token_path!r}",
+        response_description=f"Vault path {vault_settings.discord_token_path!r}",
+    )
+
+
+def authenticate_vault_userpass(vault_settings: VaultSettings) -> SecretStr:
+    """Log in with Vault's userpass method and return its client token."""
+    vault_url = vault_settings.url.rstrip("/")
+    mount_path = "/".join(quote(segment, safe="") for segment in vault_settings.userpass_mount.strip("/").split("/"))
+    username = quote(vault_settings.username, safe="")
+    request_body = json.dumps({"password": vault_settings.password.get_secret_value()}).encode("utf-8")
+    login_request = request.Request(  # noqa: S310
+        f"{vault_url}/v1/auth/{mount_path}/login/{username}",
+        data=request_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    login_response = send_vault_request(
+        login_request,
+        failure_message=f"Failed to authenticate to Vault as {vault_settings.username!r}",
+        response_description="Vault userpass login",
+    )
+    auth = login_response.get("auth")
+    if not isinstance(auth, Mapping):
+        msg = "Vault userpass login response did not contain authentication data"
+        raise TypeError(msg)
+    client_token = auth.get("client_token")
+    if not isinstance(client_token, str) or not client_token:
+        msg = "Vault userpass login response did not contain a client token"
+        raise RuntimeError(msg)
+    return SecretStr(client_token)
+
+
+def send_vault_request(
+    vault_request: request.Request,
+    *,
+    failure_message: str,
+    response_description: str,
+) -> Mapping[str, object]:
+    """Send one Vault request and return its bounded JSON object response."""
     opener = request.build_opener(NoRedirectHandler())
     try:
         with opener.open(vault_request, timeout=10) as response:
             response_body = response.read(MAX_VAULT_RESPONSE_BYTES + 1)
     except (TimeoutError, error.HTTPError, error.URLError) as exc:
-        msg = f"Failed to read Discord token from Vault path {vault_settings.discord_token_path!r}"
-        raise RuntimeError(msg) from exc
+        raise RuntimeError(failure_message) from exc
 
     if len(response_body) > MAX_VAULT_RESPONSE_BYTES:
-        msg = f"Vault path {vault_settings.discord_token_path!r} returned an oversized response"
+        msg = f"{response_description} returned an oversized response"
         raise RuntimeError(msg)
-    payload: object = json.loads(response_body.decode("utf-8"))
+    try:
+        payload: object = json.loads(response_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        msg = f"{response_description} returned invalid JSON"
+        raise RuntimeError(msg) from exc
 
     if not isinstance(payload, Mapping):
-        msg = f"Vault path {vault_settings.discord_token_path!r} returned a non-object response"
+        msg = f"{response_description} returned a non-object response"
         raise TypeError(msg)
     return payload
 

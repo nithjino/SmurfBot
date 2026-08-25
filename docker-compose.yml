@@ -14,7 +14,9 @@ services:
       SMURFBOT_REFRESH_GROUP_INTERVAL: "600"
       SMURFBOT_DISCORD_TOKEN: "${SMURFBOT_DISCORD_TOKEN:-}"
       HASHICORP_VAULT_URL: "${HASHICORP_VAULT_URL:-}" # Hosted Vault URL used when SMURFBOT_DISCORD_TOKEN is not set.
-      HASHICORP_VAULT_TOKEN: "${HASHICORP_VAULT_TOKEN:-}" # Hosted Vault auth token used when reading the Discord token.
+      HASHICORP_VAULT_USERNAME: "${HASHICORP_VAULT_USERNAME:-}" # Username for Vault's userpass auth method.
+      HASHICORP_VAULT_PASSWORD: "${HASHICORP_VAULT_PASSWORD:-}" # Password for Vault's userpass auth method.
+      SMURFBOT_VAULT_USERPASS_MOUNT: "${SMURFBOT_VAULT_USERPASS_MOUNT:-userpass}" # Vault userpass auth mount.
       SMURFBOT_VAULT_TOKEN_PATH: "${SMURFBOT_VAULT_TOKEN_PATH:-smurfbot/data/tokens}" # KV v2 API path for the bot secret.
     volumes:
       - ./data:/home/smurfbot/data
