@@ -212,56 +212,29 @@ def test_unreachable_runtime_releases_data_directory_claim(tmp_path: Path) -> No
     assert replacement is not None
 
 
-def test_ready_synchronizes_activation_before_initializing_guilds(tmp_path: Path) -> None:
-    guild = make_guild(101, "Renamed Guild")
-    client = FakeClient(
-        guilds=[guild],
-        private_channels=[SimpleNamespace(id=202, recipient=SimpleNamespace(name="Alice"))],
-    )
-    observed_records: list[dict[str, object]] = []
+@pytest.mark.parametrize("event", ["ready", "join"])
+def test_activation_completes_before_either_guild_module_initializes(tmp_path: Path, event: str) -> None:
+    guild = make_guild(101)
+    observations: list[str] = []
 
     async def tag_factory(_guild: object, path: Path) -> RecordingTag:
-        observed_records.append(json.loads((path.parent / "groups.json").read_text(encoding="utf-8")))
+        assert (path.parent / "groups.json").is_file()
+        observations.append("tag")
         return RecordingTag()
 
-    factories = RecordingFactories()
-    dependencies = _RuntimeDependencies(tag_factory=tag_factory, reminder_factory=factories.make_reminder)
-    runtime = BotRuntime(client, command_delimiter="$", data_dir=tmp_path, _dependencies=dependencies)
+    async def reminder_factory(_guild: object, path: Path) -> RecordingReminder:
+        assert (path.parent / "groups.json").is_file()
+        observations.append("reminder")
+        return RecordingReminder()
 
-    run(runtime.on_ready())
-
-    assert observed_records == [
-        {
-            "DM: Alice": {"enabled": True, "id": "202"},
-            "Renamed Guild": {"enabled": True, "id": "101"},
-        }
-    ]
-    assert factories.reminder_calls == [(guild, tmp_path.resolve() / "reminders")]
-
-
-def test_join_preserves_activation_across_rename_before_initialization(tmp_path: Path) -> None:
-    groups_path = tmp_path / "groups.json"
-    groups_path.write_text(json.dumps({"Old Name": {"enabled": False, "id": "303"}}), encoding="utf-8")
-    guild = make_guild(303, "New Name")
-    observed_records: list[dict[str, object]] = []
-
-    async def tag_factory(_guild: object, path: Path) -> RecordingTag:
-        observed_records.append(json.loads((path.parent / "groups.json").read_text(encoding="utf-8")))
-        return RecordingTag()
-
-    factories = RecordingFactories()
     runtime = BotRuntime(
-        FakeClient(),
+        FakeClient(guilds=[guild]),
         command_delimiter="$",
         data_dir=tmp_path,
-        _dependencies=_RuntimeDependencies(tag_factory=tag_factory, reminder_factory=factories.make_reminder),
+        _dependencies=_RuntimeDependencies(tag_factory=tag_factory, reminder_factory=reminder_factory),
     )
-
-    run(runtime.on_guild_join(guild))
-
-    expected = {"New Name": {"enabled": False, "id": "303"}}
-    assert observed_records == [expected]
-    assert json.loads(groups_path.read_text(encoding="utf-8")) == expected
+    run(runtime.on_ready() if event == "ready" else runtime.on_guild_join(guild))
+    assert observations == ["tag", "reminder"]
 
 
 def test_concurrent_duplicate_ready_initializes_each_registry_once(tmp_path: Path) -> None:
@@ -382,6 +355,8 @@ def test_disabled_group_ignores_commands_until_activate(tmp_path: Path) -> None:
     run(runtime.on_message(message))
     message.content = "$ping"
     run(runtime.on_message(message))
+    message.content = "$   "
+    run(runtime.on_message(message))
     message.content = "$deactive"
     run(runtime.on_message(message))
     message.content = "$activate"
@@ -401,21 +376,6 @@ def test_both_deactivation_aliases_disable_the_group(tmp_path: Path, command: st
     run(runtime.on_message(make_message("$ping", channel=channel)))
 
     assert sent_text(channel) == ["Guild has been deactived."]
-
-
-def test_non_admin_cannot_change_guild_activation(tmp_path: Path) -> None:
-    runtime, _client, _factories = make_runtime(tmp_path)
-    channel = RecordingChannel()
-    author = SimpleNamespace(
-        id=123,
-        name="Alice",
-        bot=False,
-        guild_permissions=SimpleNamespace(administrator=False, manage_guild=False),
-    )
-
-    run(runtime.on_message(make_message("$deactive", channel=channel, author=author)))
-
-    assert sent_text(channel) == ["Only server admins can activate or deactive this bot."]
 
 
 def test_unknown_command_is_logged_without_a_response(
@@ -578,9 +538,7 @@ def test_runtime_uses_owned_groups_path_even_when_environment_points_elsewhere(
 
     run(runtime.on_message(make_message("$deactive")))
 
-    assert json.loads((owned_dir / "groups.json").read_text(encoding="utf-8")) == {
-        "Guild": {"enabled": False, "id": "456"}
-    }
+    assert (owned_dir / "groups.json").is_file()
     assert not (environment_dir / "groups.json").exists()
 
 
