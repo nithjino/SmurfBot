@@ -1,7 +1,8 @@
-"""Persistence helpers for bot activation state."""
+"""Owned group activation transactions and data-directory configuration."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -74,12 +75,7 @@ def get_state_paths() -> tuple[Path, Path]:
     return data_dir / "tags", data_dir / "reminders"
 
 
-def get_groups_path() -> Path:
-    """Return the path to the group and DM activation state file."""
-    return get_data_dir() / GROUPS_FILENAME
-
-
-def load_group_records_sync(groups_path: Path) -> dict[str, dict[str, Any]]:
+def _load_group_records_sync(groups_path: Path) -> dict[str, dict[str, Any]]:
     """Return persisted group activation records."""
     if not groups_path.exists():
         return {}
@@ -91,24 +87,14 @@ def load_group_records_sync(groups_path: Path) -> dict[str, dict[str, Any]]:
     return records
 
 
-async def load_group_records(groups_path: Path | None = None) -> dict[str, dict[str, Any]]:
-    """Load group activation records."""
-    return load_group_records_sync(groups_path or get_groups_path())
-
-
-def save_group_records_sync(groups_path: Path, records: dict[str, dict[str, Any]]) -> None:
+def _save_group_records_sync(groups_path: Path, records: dict[str, dict[str, Any]]) -> None:
     """Persist group activation records."""
     groups_path.parent.mkdir(parents=True, exist_ok=True)
     with atomic_write(groups_path, overwrite=True, encoding="utf-8") as groups_file:
         groups_file.write(json.dumps(records, sort_keys=True, indent=2))
 
 
-async def save_group_records(records: dict[str, dict[str, Any]], groups_path: Path | None = None) -> None:
-    """Save group activation records."""
-    save_group_records_sync(groups_path or get_groups_path(), records)
-
-
-def unique_group_name(records: dict[str, dict[str, Any]], name: str, group_id: str) -> str:
+def _unique_group_name(records: dict[str, dict[str, Any]], name: str, group_id: str) -> str:
     """Return a stable name key for a group record."""
     existing_record = records.get(name)
     if existing_record is None or str(existing_record.get("id")) == group_id:
@@ -116,14 +102,14 @@ def unique_group_name(records: dict[str, dict[str, Any]], name: str, group_id: s
     return f"{name} ({group_id})"
 
 
-def upsert_group_record(records: dict[str, dict[str, Any]], name: str, group_id: int | str) -> bool:
+def _upsert_group_record(records: dict[str, dict[str, Any]], name: str, group_id: int | str) -> bool:
     """Add or rename a group record while preserving its enabled value."""
     group_id = str(group_id)
     existing_key = next((key for key, record in records.items() if str(record.get("id")) == group_id), None)
     if existing_key is not None:
         record = records[existing_key]
         enabled = bool(record.get("enabled", True))
-        name = unique_group_name(records, name, group_id)
+        name = _unique_group_name(records, name, group_id)
         if existing_key != name:
             del records[existing_key]
             records[name] = {"enabled": enabled, "id": group_id}
@@ -134,11 +120,11 @@ def upsert_group_record(records: dict[str, dict[str, Any]], name: str, group_id:
             return True
         return False
 
-    records[unique_group_name(records, name, group_id)] = {"enabled": True, "id": group_id}
+    records[_unique_group_name(records, name, group_id)] = {"enabled": True, "id": group_id}
     return True
 
 
-def get_private_channel_name(channel: object) -> str:
+def _get_private_channel_name(channel: object) -> str:
     """Return a display name for a Discord DM or group DM channel."""
     recipient = getattr(channel, "recipient", None)
     if recipient is not None and getattr(recipient, "name", None):
@@ -153,46 +139,14 @@ def get_private_channel_name(channel: object) -> str:
     return f"DM: {getattr(channel, 'id', 'unknown')}"
 
 
-def get_message_group_name_and_id(message: MessageContext) -> tuple[str, int]:
+def _get_message_group_name_and_id(message: MessageContext) -> tuple[str, int]:
     """Return the group state identity for an incoming Discord message."""
     if message.guild is not None:
         return message.guild.name, message.guild.id
-    return get_private_channel_name(message.channel), message.channel.id
+    return _get_private_channel_name(message.channel), message.channel.id
 
 
-async def sync_group_records(
-    guilds: Sequence[GroupIdentity],
-    private_channels: Sequence[MessageChannel],
-    groups_path: Path | None = None,
-) -> None:
-    """Write all visible guilds and cached DMs to the group activation file."""
-    groups_path = groups_path or get_groups_path()
-    records = await load_group_records(groups_path)
-    changed = False
-    for guild in guilds:
-        changed = upsert_group_record(records, guild.name, guild.id) or changed
-    for channel in private_channels:
-        changed = upsert_group_record(records, get_private_channel_name(channel), channel.id) or changed
-    if changed or not groups_path.exists():
-        await save_group_records(records, groups_path)
-
-
-async def is_message_group_enabled(message: MessageContext, groups_path: Path | None = None) -> bool:
-    """Return whether the message context is enabled for bot command responses."""
-    name, group_id = get_message_group_name_and_id(message)
-    groups_path = groups_path or get_groups_path()
-    records = await load_group_records(groups_path)
-    changed = upsert_group_record(records, name, group_id)
-    enabled = next(
-        (bool(record.get("enabled", True)) for record in records.values() if str(record.get("id")) == str(group_id)),
-        True,
-    )
-    if changed:
-        await save_group_records(records, groups_path)
-    return enabled
-
-
-def can_manage_group_state(message: MessageContext) -> bool:
+def _can_manage_group_state(message: MessageContext) -> bool:
     """Return whether the command author can change the current group state."""
     if message.guild is None:
         return True
@@ -200,24 +154,67 @@ def can_manage_group_state(message: MessageContext) -> bool:
     return bool(getattr(permissions, "administrator", False) or getattr(permissions, "manage_guild", False))
 
 
-async def set_message_group_enabled(
-    message: MessageContext,
-    *,
-    enabled: bool,
-    groups_path: Path | None = None,
-) -> str:
-    """Enable or disable command responses for the current Discord context."""
-    if not can_manage_group_state(message):
-        return "Only server admins can activate or deactive this bot."
+class GroupActivation:
+    """Own identity, permissions, and serialized activation file transactions."""
 
-    name, group_id = get_message_group_name_and_id(message)
-    groups_path = groups_path or get_groups_path()
-    records = await load_group_records(groups_path)
-    upsert_group_record(records, name, group_id)
-    for record in records.values():
-        if str(record.get("id")) == str(group_id):
-            record["enabled"] = enabled
-            break
-    await save_group_records(records, groups_path)
-    state = "activated" if enabled else "deactived"
-    return f"{name} has been {state}."
+    def __init__(self, groups_path: Path) -> None:
+        """Keep one explicit persistence path and a lock for its transactions."""
+        self._groups_path = groups_path
+        self._lock = asyncio.Lock()
+
+    async def synchronize(
+        self,
+        guilds: Sequence[GroupIdentity],
+        private_channels: Sequence[MessageChannel],
+    ) -> None:
+        """Synchronize visible Groups without losing activation or invisible records."""
+        async with self._lock:
+            records = _load_group_records_sync(self._groups_path)
+            changed = False
+            for guild in guilds:
+                changed = _upsert_group_record(records, guild.name, guild.id) or changed
+            for channel in private_channels:
+                changed = _upsert_group_record(records, _get_private_channel_name(channel), channel.id) or changed
+            if changed or not self._groups_path.exists():
+                _save_group_records_sync(self._groups_path, records)
+
+    async def record_join(self, guild: GroupIdentity) -> None:
+        """Record a join or rename while preserving the Group's activation choice."""
+        async with self._lock:
+            records = _load_group_records_sync(self._groups_path)
+            if _upsert_group_record(records, guild.name, guild.id):
+                _save_group_records_sync(self._groups_path, records)
+
+    async def is_enabled(self, message: MessageContext) -> bool:
+        """Return activation, persisting a missing Group with its current default."""
+        async with self._lock:
+            name, group_id = _get_message_group_name_and_id(message)
+            records = _load_group_records_sync(self._groups_path)
+            changed = _upsert_group_record(records, name, group_id)
+            enabled = next(
+                (
+                    bool(record.get("enabled", True))
+                    for record in records.values()
+                    if str(record.get("id")) == str(group_id)
+                ),
+                True,
+            )
+            if changed:
+                _save_group_records_sync(self._groups_path, records)
+            return enabled
+
+    async def set_enabled(self, message: MessageContext, *, enabled: bool) -> str:
+        """Authorize, persist, and describe an activation change as one transaction."""
+        async with self._lock:
+            if not _can_manage_group_state(message):
+                return "Only server admins can activate or deactive this bot."
+            name, group_id = _get_message_group_name_and_id(message)
+            records = _load_group_records_sync(self._groups_path)
+            _upsert_group_record(records, name, group_id)
+            for record in records.values():
+                if str(record.get("id")) == str(group_id):
+                    record["enabled"] = enabled
+                    break
+            _save_group_records_sync(self._groups_path, records)
+            state = "activated" if enabled else "deactived"
+            return f"{name} has been {state}."

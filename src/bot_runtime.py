@@ -13,15 +13,7 @@ from weakref import WeakValueDictionary
 
 import discord
 
-from bot_state import (
-    GROUPS_FILENAME,
-    is_message_group_enabled,
-    load_group_records,
-    save_group_records,
-    set_message_group_enabled,
-    sync_group_records,
-    upsert_group_record,
-)
+from bot_state import GROUPS_FILENAME, GroupActivation
 from discord_messages import send_command_response
 from models import CommandParameters
 from reminders import Reminders
@@ -94,7 +86,7 @@ class BotRuntime:
 
         self._client = client
         self._command_delimiter = command_delimiter
-        self._groups_path = canonical_data_dir / GROUPS_FILENAME
+        self._activation = GroupActivation(canonical_data_dir / GROUPS_FILENAME)
         self._tag_path = canonical_data_dir / "tags"
         self._reminder_path = canonical_data_dir / "reminders"
         self._tag_factory = dependencies.tag_factory
@@ -123,16 +115,14 @@ class BotRuntime:
     async def on_ready(self) -> None:
         """Synchronize activation state, then initialize every visible guild."""
         _logger.info("We have logged in as %s", self._client.user)
-        await sync_group_records(self._client.guilds, self._client.private_channels, self._groups_path)
+        await self._activation.synchronize(self._client.guilds, self._client.private_channels)
         for guild in self._client.guilds:
             await self._initialize_guild(guild)
         _logger.info("Initializing Done")
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         """Preserve activation state across guild renames, then initialize the guild."""
-        records = await load_group_records(self._groups_path)
-        if upsert_group_record(records, guild.name, guild.id):
-            await save_group_records(records, self._groups_path)
+        await self._activation.record_join(guild)
         await self._initialize_guild(guild)
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
@@ -181,7 +171,7 @@ class BotRuntime:
     async def _handle_command_message(self, message: discord.Message, command_parts: list[str]) -> None:
         """Apply activation rules and dispatch parsed command parts."""
         if not command_parts:
-            if not await is_message_group_enabled(message, self._groups_path):
+            if not await self._activation.is_enabled(message):
                 return
             await self._send_command_response_or_log(message, await self._post_help(), "help")
             return
@@ -189,12 +179,12 @@ class BotRuntime:
         _logger.info("command: %s", command_parts)
         user_command = command_parts[0].lower()
         if user_command == ACTIVATE_COMMAND:
-            result = await set_message_group_enabled(message, enabled=True, groups_path=self._groups_path)
+            result = await self._activation.set_enabled(message, enabled=True)
             await self._send_command_response_or_log(message, result, user_command)
-        elif not await is_message_group_enabled(message, self._groups_path):
+        elif not await self._activation.is_enabled(message):
             return
         elif user_command in {DEACTIVE_COMMAND, DEACTIVATE_COMMAND}:
-            result = await set_message_group_enabled(message, enabled=False, groups_path=self._groups_path)
+            result = await self._activation.set_enabled(message, enabled=False)
             await self._send_command_response_or_log(message, result, user_command)
         elif user_command in self._commands:
             result = await self._dispatch_command(message, user_command, command_parts[1:])
