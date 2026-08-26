@@ -1,47 +1,95 @@
-"""Tests for reminder parsing and creation behavior."""
+"""Reminder behavior through construction, commands, delivery adapters, and shutdown."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import discord
 import pytest
+from pydantic import ValidationError
 
 from message_limits import DISCORD_MESSAGE_LIMIT, TRUNCATION_SUFFIX
-from reminders.constants import (
-    DATE_FORMAT,
-    MAX_REMINDER_SECONDS,
-    MAX_REMINDERS_PER_GUILD,
-    REMINDER_DELIVERY_ATTEMPTS,
-    REMINDER_DELIVERY_RETRY_DELAY_SECONDS,
-)
-from reminders.models import ReminderRecord
-from reminders.reminders import Reminders, add_time_to_date, has_datetime_passed, parse_time
+from models import CommandParameters
+from reminders.constants import MAX_REMINDER_SECONDS, MAX_REMINDERS_PER_GUILD
+from reminders.reminders import Reminders, _ReminderDependencies
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
     from pathlib import Path
+
+NOW = datetime(2026, 6, 4, 12, tzinfo=UTC)
+HELP = (
+    "Format: $remind [amount of time] [message]. Example: $remind 1h check laundry\nSupport units: "
+    "s (seconds), m (minutes), h (hours), or d (days)."
+)
 
 
 def run[T](coro: Coroutine[object, object, T]) -> T:
     return asyncio.run(coro)
 
 
-class RecordingReminders(Reminders):
-    def __init__(self, reminders_json_path: Path) -> None:
-        super().__init__(SimpleNamespace(id=202, name="Guild"), reminders_json_path)
-        self.saved_count = 0
-        self.created_timers: list[tuple[ReminderRecord, float]] = []
+def command(*message: str, author_name: str = "Alice") -> CommandParameters:
+    return CommandParameters(
+        command="remind",
+        message=list(message),
+        created_at=NOW,
+        author_id=1,
+        author_name=author_name,
+        guild_id=202,
+        channel_id=303,
+    )
 
-    async def _save_reminders_unlocked(self) -> None:
-        self.saved_count += 1
 
-    def create_timer(self, reminder: ReminderRecord, delay_seconds: float) -> None:
-        self.created_timers.append((reminder, delay_seconds))
+def record(*, execution_time: str = "2026-06-04T12:05:00") -> dict[str, object]:
+    return {
+        "user_id": 1,
+        "name": "Alice",
+        "message": "check laundry",
+        "created_at": "2026-06-04T12:00:00",
+        "execution_time": execution_time,
+        "timezone": "utc",
+        "guild_id": 202,
+        "channel_id": 303,
+    }
+
+
+def persisted(path: Path) -> dict[str, object]:
+    return json.loads((path / "202.json").read_text(encoding="utf-8"))
+
+
+class ControlledSleep:
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+        self.waiting: asyncio.Queue[asyncio.Future[None]] = asyncio.Queue()
+        self.cancelled = 0
+
+    async def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+        future = asyncio.get_running_loop().create_future()
+        self.waiting.put_nowait(future)
+        try:
+            await future
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+
+    async def advance(self) -> None:
+        future = await asyncio.wait_for(self.waiting.get(), timeout=1)
+        future.set_result(None)
+        await asyncio.sleep(0)
+
+
+class RecordingChannel(discord.abc.Messageable):
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, dict[str, object]]] = []
+
+    async def send(self, content: str, **kwargs: object) -> None:
+        self.sent.append((content, kwargs))
 
 
 class FakeGuild:
@@ -50,283 +98,303 @@ class FakeGuild:
 
     def __init__(self, channel: object) -> None:
         self.channel = channel
-        self.channel_lookup_count = 0
+        self.lookups: list[int] = []
 
-    def get_channel(self, _channel_id: int) -> object:
-        self.channel_lookup_count += 1
+    def get_channel(self, channel_id: int) -> object:
+        self.lookups.append(channel_id)
         return self.channel
 
 
-class RecordingDeliveryReminders(Reminders):
-    def __init__(self, channel: object, reminders_json_path: Path) -> None:
-        self.fake_guild = FakeGuild(channel)
-        super().__init__(self.fake_guild, reminders_json_path)
-        self.saved_count = 0
+def test_construction_creates_exact_file(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        reminders = await Reminders.create(FakeGuild(None), tmp_path)
+        assert persisted(tmp_path) == {"name": "Guild", "id": 202, "reminders": []}
+        await reminders.close()
+        await reminders.close()
 
-    async def _save_reminders_unlocked(self) -> None:
-        self.saved_count += 1
-
-
-class FlakyMessageable(discord.abc.Messageable):
-    def __init__(self, failures_before_success: int) -> None:
-        self.attempts = 0
-        self.failures_before_success = failures_before_success
-        self.sent_messages: list[str] = []
-        self.sent_kwargs: list[dict[str, object]] = []
-
-    async def send(self, *args: object, **kwargs: object) -> None:
-        self.attempts += 1
-        if self.failures_before_success > 0:
-            self.failures_before_success -= 1
-            response = SimpleNamespace(status=500, reason="Server Error")
-            raise discord.HTTPException(response, "send failed")
-        self.sent_messages.append(str(args[0]))
-        self.sent_kwargs.append(kwargs)
+    run(exercise())
 
 
-def make_reminder() -> ReminderRecord:
-    return ReminderRecord(
-        user_id=1,
-        name="Alice",
-        message="check laundry",
-        created_at=datetime.now(UTC).strftime(DATE_FORMAT),
-        execution_time=(datetime.now(UTC) + timedelta(minutes=5)).strftime(DATE_FORMAT),
-        timezone="utc",
-        guild_id=202,
-        channel_id=303,
-    )
+@pytest.mark.parametrize("message", [(), ("help",), ("list",), ("5m",), ("help", "ignored")])
+def test_help_and_argument_count_quirk(tmp_path: Path, message: tuple[str, ...]) -> None:
+    async def exercise() -> None:
+        reminders = await Reminders.create(FakeGuild(None), tmp_path)
+        before = (tmp_path / "202.json").read_bytes()
+        assert await reminders.handle(command(*message)) == HELP
+        assert (tmp_path / "202.json").read_bytes() == before
+        await reminders.close()
+
+    run(exercise())
 
 
-def patch_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    sleep_calls: list[float] = []
+@pytest.mark.parametrize(
+    ("duration", "response"),
+    [
+        ("2w", "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"),
+        ("soon", "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"),
+        ("xs", "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"),
+        (f"{MAX_REMINDER_SECONDS + 1}s", "Why are you using this feature for a reminder that far in the future?"),
+        ("0s", "Why are you trying to set a reminder for the past?"),
+        ("-1h", "Why are you trying to set a reminder for the past?"),
+    ],
+)
+def test_invalid_duration_does_not_write_or_schedule(tmp_path: Path, duration: str, response: str) -> None:
+    async def exercise() -> None:
+        sleep = ControlledSleep()
+        reminders = await Reminders.create(FakeGuild(None), tmp_path, _dependencies=_ReminderDependencies(sleep=sleep))
+        before = (tmp_path / "202.json").stat()
+        assert await reminders.handle(command(duration, "stretch")) == response
+        assert (tmp_path / "202.json").stat() == before
+        await asyncio.sleep(0)
+        assert sleep.calls == []
+        await reminders.close()
 
-    async def fake_sleep(seconds: float) -> None:
-        sleep_calls.append(seconds)
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    return sleep_calls
-
-
-def test_parse_time_accepts_supported_units_and_rejects_bad_values() -> None:
-    assert parse_time("30s") == 30
-    assert parse_time("2m") == 120
-    assert parse_time("3h") == 10_800
-    assert parse_time("4d") == 345_600
-    assert parse_time("") is None
-    assert parse_time("10w") is None
-    assert parse_time("soon") is None
-
-
-def test_add_time_and_has_datetime_passed_support_datetime_strings() -> None:
-    start = datetime(2026, 6, 4, 12, 0, 0, tzinfo=UTC)
-    serialized_start = start.strftime(DATE_FORMAT)
-
-    assert add_time_to_date(start, 90) == datetime(2026, 6, 4, 12, 1, 30, tzinfo=UTC)
-    assert add_time_to_date(serialized_start, 90) == datetime(2026, 6, 4, 12, 1, 30, tzinfo=UTC)
-
-    future = (datetime.now(UTC) + timedelta(seconds=60)).strftime(DATE_FORMAT)
-    past = (datetime.now(UTC) - timedelta(seconds=60)).strftime(DATE_FORMAT)
-
-    future_result = has_datetime_passed(future)
-    past_result = has_datetime_passed(past)
-
-    assert future_result.result is False
-    assert 0 < future_result.seconds_until_execution <= 60
-    assert past_result.result is True
-    assert past_result.seconds_until_execution == -1
+    run(exercise())
 
 
-def test_create_reminder_rejects_invalid_durations_without_persisting(tmp_path: Path) -> None:
-    reminders = RecordingReminders(tmp_path)
-
-    unsupported = run(reminders.create_reminder("2w", ["stretch"], 1, 202, 303))
-    too_far = run(reminders.create_reminder(f"{MAX_REMINDER_SECONDS + 1}s", ["stretch"], 1, 202, 303))
-    past = run(reminders.create_reminder("0s", ["stretch"], 1, 202, 303))
-
-    assert unsupported == "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"
-    assert too_far == "Why are you using this feature for a reminder that far in the future?"
-    assert past == "Why are you trying to set a reminder for the past?"
-    assert reminders.saved_count == 0
-    assert reminders.created_timers == []
-    assert reminders.reminders.reminders == []
-
-
-def test_create_reminder_persists_record_and_schedules_timer(tmp_path: Path) -> None:
-    reminders = RecordingReminders(tmp_path)
-
-    result = run(reminders.create_reminder("5m", ["check", "laundry"], 1, 202, 303, user_name="Alice"))
-
-    assert result.startswith("Created reminder for Alice to go off at ")
-    assert result.endswith(" that says `check laundry`")
-    assert reminders.saved_count == 1
-    assert len(reminders.reminders.reminders) == 1
-    assert len(reminders.created_timers) == 1
-
-    reminder = reminders.reminders.reminders[0]
-    scheduled_reminder, delay_seconds = reminders.created_timers[0]
-
-    assert scheduled_reminder is reminder
-    assert delay_seconds == 300
-    assert reminder.user_id == 1
-    assert reminder.name == "Alice"
-    assert reminder.message == "check laundry"
-    assert reminder.guild_id == 202
-    assert reminder.channel_id == 303
-
-
-def test_create_reminder_uses_provided_user_name_without_fetching_user(tmp_path: Path) -> None:
-    reminders = RecordingReminders(tmp_path)
-
-    result = run(
-        reminders.create_reminder(
-            "5m",
-            ["check", "laundry"],
-            1,
-            202,
-            303,
-            user_name="Alice From Message",
+@pytest.mark.parametrize(("duration", "delay"), [("30s", 30), ("2M", 120), ("3h", 10800), ("4d", 345600)])
+def test_supported_durations_schedule(tmp_path: Path, duration: str, delay: int) -> None:
+    async def exercise() -> None:
+        sleep = ControlledSleep()
+        reminders = await Reminders.create(
+            FakeGuild(None), tmp_path, _dependencies=_ReminderDependencies(now=lambda: NOW, sleep=sleep)
         )
-    )
+        await reminders.handle(command(duration, "stretch"))
+        await asyncio.sleep(0)
+        assert sleep.calls == [delay]
+        await reminders.close()
 
-    assert result.startswith("Created reminder for Alice From Message to go off at ")
-    assert reminders.reminders.reminders[0].name == "Alice From Message"
-
-
-def test_create_reminder_falls_back_to_user_id_when_name_is_unavailable(tmp_path: Path) -> None:
-    reminders = RecordingReminders(tmp_path)
-
-    result = run(reminders.create_reminder("5m", ["check", "laundry"], 1, 202, 303))
-
-    assert result.startswith("Created reminder for 1 to go off at ")
-    assert reminders.reminders.reminders[0].name == "1"
+    run(exercise())
 
 
-def test_create_reminder_truncates_message_and_response_to_discord_limit(tmp_path: Path) -> None:
-    reminders = RecordingReminders(tmp_path)
-    long_message = "a" * (DISCORD_MESSAGE_LIMIT + 50)
+@pytest.mark.parametrize("author_name", ["Alice", ""])
+def test_create_persists_before_scheduling_and_formats_dates(tmp_path: Path, author_name: str) -> None:
+    async def exercise() -> None:
+        sleep = ControlledSleep()
+        snapshots: list[dict[str, object]] = []
 
-    result = run(reminders.create_reminder("5m", [long_message], 1, 202, 303, user_name="Alice"))
+        async def observe_sleep(seconds: float) -> None:
+            snapshots.append(persisted(tmp_path))
+            await sleep(seconds)
 
-    assert len(result) == DISCORD_MESSAGE_LIMIT
-    assert result.endswith(TRUNCATION_SUFFIX)
-    assert len(reminders.reminders.reminders[0].message) == DISCORD_MESSAGE_LIMIT
-    assert reminders.reminders.reminders[0].message.endswith(TRUNCATION_SUFFIX)
-
-
-def test_list_reminders_truncates_to_discord_limit(tmp_path: Path) -> None:
-    reminders = RecordingReminders(tmp_path)
-    future_execution = (datetime.now(UTC) + timedelta(days=1)).strftime(DATE_FORMAT)
-    for index in range(25):
-        reminders.reminders.reminders.append(
-            ReminderRecord(
-                user_id=index,
-                name=f"User {index}",
-                message="a" * 100,
-                created_at=datetime.now(UTC).strftime(DATE_FORMAT),
-                execution_time=future_execution,
-                timezone="utc",
-                guild_id=202,
-                channel_id=303,
-            )
+        reminders = await Reminders.create(
+            FakeGuild(None), tmp_path, _dependencies=_ReminderDependencies(now=lambda: NOW, sleep=observe_sleep)
         )
-
-    result = run(reminders.list_reminders())
-
-    assert len(result) == DISCORD_MESSAGE_LIMIT
-    assert result.endswith(TRUNCATION_SUFFIX)
-
-
-def test_create_reminder_rejects_new_reminders_when_guild_limit_is_reached(tmp_path: Path) -> None:
-    reminders = RecordingReminders(tmp_path)
-    future_execution = (datetime.now(UTC) + timedelta(days=1)).strftime(DATE_FORMAT)
-    for index in range(MAX_REMINDERS_PER_GUILD):
-        reminders.reminders.reminders.append(
-            ReminderRecord(
-                user_id=index,
-                name=f"User {index}",
-                message="stretch",
-                created_at=datetime.now(UTC).strftime(DATE_FORMAT),
-                execution_time=future_execution,
-                timezone="utc",
-                guild_id=202,
-                channel_id=303,
-            )
+        name = author_name or "1"
+        assert await reminders.handle(command("5m", "check", "laundry", author_name=author_name)) == (
+            f"Created reminder for {name} to go off at 06/04/2026 @ 08:05AM that says `check laundry`"
         )
+        expected = {"name": "Guild", "id": 202, "reminders": [{**record(), "name": name}]}
+        assert persisted(tmp_path) == expected
+        await asyncio.sleep(0)
+        assert snapshots == [expected]
+        assert sleep.calls == [300]
+        assert await reminders.handle(command("list", "ignored")) == (
+            f"\nCreated by: {name}\nReminder date: 06/04/2026 @ 08:05AM\nReminder message: check laundry\n"
+        )
+        await reminders.close()
 
-    result = run(reminders.create_reminder("5m", ["stretch"], 1, 202, 303))
-
-    assert result == (
-        "Reminder limit reached. Delete or wait for a reminder to complete before creating a new one. Limit: "
-        f"{MAX_REMINDERS_PER_GUILD}"
-    )
-    assert reminders.saved_count == 0
-    assert reminders.created_timers == []
-    assert len(reminders.reminders.reminders) == MAX_REMINDERS_PER_GUILD
+    run(exercise())
 
 
-def test_send_message_retries_failures_and_removes_after_success(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_load_cleans_expired_and_schedules_active_records(tmp_path: Path) -> None:
+    source = {"name": "Guild", "id": 202, "reminders": [record(execution_time="2026-06-04T12:00:00"), record()]}
+    (tmp_path / "202.json").write_text(json.dumps(source), encoding="utf-8")
+
+    async def exercise() -> None:
+        sleep = ControlledSleep()
+        reminders = await Reminders.create(
+            FakeGuild(None), tmp_path, _dependencies=_ReminderDependencies(now=lambda: NOW, sleep=sleep)
+        )
+        assert persisted(tmp_path) == {**source, "reminders": [record()]}
+        await asyncio.sleep(0)
+        assert sleep.calls == [300]
+        await reminders.close()
+
+    run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("source", "error"),
+    [("{bad json", json.JSONDecodeError), ('{"id": 202, "name": "Guild", "reminders": [{}]}', ValidationError)],
+)
+def test_malformed_source_unchanged(tmp_path: Path, source: str, error: type[Exception]) -> None:
+    path = tmp_path / "202.json"
+    path.write_text(source, encoding="utf-8")
+    with pytest.raises(error):
+        run(Reminders.create(FakeGuild(None), tmp_path))
+    assert path.read_text(encoding="utf-8") == source
+
+
+def test_list_cleanup_and_empty_response(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        now = NOW
+        reminders = await Reminders.create(
+            FakeGuild(None), tmp_path, _dependencies=_ReminderDependencies(now=lambda: now, sleep=ControlledSleep())
+        )
+        assert await reminders.handle(command("list", "ignored")) == "No active reminds were found"
+        await reminders.handle(command("5m", "stretch"))
+        now = datetime(2026, 6, 5, tzinfo=UTC)
+        assert await reminders.handle(command("list", "ignored")) == "No active reminds were found"
+        assert persisted(tmp_path)["reminders"] == []
+        await reminders.close()
+
+    run(exercise())
+
+
+def test_truncation_and_guild_limit(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        reminders = await Reminders.create(
+            FakeGuild(None), tmp_path, _dependencies=_ReminderDependencies(now=lambda: NOW, sleep=ControlledSleep())
+        )
+        result = await reminders.handle(command("5m", "a" * (DISCORD_MESSAGE_LIMIT + 50)))
+        assert len(result) == DISCORD_MESSAGE_LIMIT
+        assert result.endswith(TRUNCATION_SUFFIX)
+        saved = persisted(tmp_path)["reminders"][0]["message"]
+        assert len(saved) == DISCORD_MESSAGE_LIMIT
+        assert saved.endswith(TRUNCATION_SUFFIX)
+        for _ in range(MAX_REMINDERS_PER_GUILD - 1):
+            await reminders.handle(command("5m", "stretch"))
+        before = (tmp_path / "202.json").read_bytes()
+        assert await reminders.handle(command("5m", "stretch")) == (
+            "Reminder limit reached. Delete or wait for a reminder to complete before creating a new one. Limit: 100"
+        )
+        assert (tmp_path / "202.json").read_bytes() == before
+        result = await reminders.handle(command("list", "ignored"))
+        assert len(result) == DISCORD_MESSAGE_LIMIT
+        assert result.endswith(TRUNCATION_SUFFIX)
+        await reminders.close()
+
+    run(exercise())
+
+
+@pytest.mark.parametrize("failures", [0, 2, 3])
+def test_delivery_retries_then_persists_removal(
+    tmp_path: Path, failures: int, caplog: pytest.LogCaptureFixture
 ) -> None:
-    sleep_calls = patch_sleep(monkeypatch)
-    channel = FlakyMessageable(failures_before_success=2)
-    reminders = RecordingDeliveryReminders(channel, tmp_path)
-    reminder = make_reminder()
-    reminders.reminders.reminders.append(reminder)
+    caplog.set_level(logging.INFO, logger="reminders.reminders")
 
-    run(reminders.send_message(reminder, 0))
+    async def exercise() -> None:
+        sleep = ControlledSleep()
+        channel = RecordingChannel()
+        guild = FakeGuild(channel)
+        attempts: list[tuple[object, int, str]] = []
 
-    assert channel.attempts == REMINDER_DELIVERY_ATTEMPTS
-    assert channel.sent_messages == ["<@1> reminder: check laundry"]
-    assert channel.sent_kwargs[0]["allowed_mentions"].to_dict() == {"users": [1], "parse": []}
-    assert reminders.reminders.reminders == []
-    assert reminders.saved_count == 1
-    assert sleep_calls == [0, REMINDER_DELIVERY_RETRY_DELAY_SECONDS, REMINDER_DELIVERY_RETRY_DELAY_SECONDS]
+        async def send(target: discord.abc.Messageable, user_id: int, content: str) -> None:
+            attempts.append((target, user_id, content))
+            if len(attempts) <= failures:
+                raise discord.HTTPException(SimpleNamespace(status=500, reason="Server Error"), "send failed")
 
+        reminders = await Reminders.create(
+            guild, tmp_path, _dependencies=_ReminderDependencies(now=lambda: NOW, sleep=sleep, send_reminder=send)
+        )
+        await reminders.handle(command("5m", "check", "laundry"))
+        for _ in range(min(failures + 1, 3)):
+            await sleep.advance()
+        assert attempts == [(channel, 1, "check laundry")] * min(failures + 1, 3)
+        assert guild.lookups == [303] * len(attempts)
+        assert sleep.calls == [300] + [60] * (len(attempts) - 1)
+        assert persisted(tmp_path)["reminders"] == []
+        before = (tmp_path / "202.json").stat()
+        await reminders.close()
+        assert (tmp_path / "202.json").stat() == before
 
-def test_send_message_removes_reminder_after_final_send_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    sleep_calls = patch_sleep(monkeypatch)
-    channel = FlakyMessageable(failures_before_success=REMINDER_DELIVERY_ATTEMPTS)
-    reminders = RecordingDeliveryReminders(channel, tmp_path)
-    reminder = make_reminder()
-    reminders.reminders.reminders.append(reminder)
-
-    with caplog.at_level(logging.ERROR):
-        run(reminders.send_message(reminder, 0))
-
-    assert channel.attempts == REMINDER_DELIVERY_ATTEMPTS
-    assert reminders.reminders.reminders == []
-    assert reminders.saved_count == 1
-    assert sleep_calls == [0, REMINDER_DELIVERY_RETRY_DELAY_SECONDS, REMINDER_DELIVERY_RETRY_DELAY_SECONDS]
-    assert "failed to send reminder after 3 attempts" in caplog.text
+    run(exercise())
+    assert sum(": saving:" in record.message for record in caplog.records) == 2
+    if failures == 3:
+        assert "failed to send reminder after 3 attempts" in caplog.text
 
 
 @pytest.mark.parametrize("channel", [None, object()])
-def test_send_message_retries_unavailable_channels_then_removes_reminder(
-    channel: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    sleep_calls = patch_sleep(monkeypatch)
-    reminders = RecordingDeliveryReminders(channel, tmp_path)
-    reminder = make_reminder()
-    reminders.reminders.reminders.append(reminder)
-
-    with caplog.at_level(logging.ERROR):
-        run(reminders.send_message(reminder, 0))
-
-    assert reminders.fake_guild.channel_lookup_count == REMINDER_DELIVERY_ATTEMPTS
-    assert reminders.reminders.reminders == []
-    assert reminders.saved_count == 1
-    assert sleep_calls == [0, REMINDER_DELIVERY_RETRY_DELAY_SECONDS, REMINDER_DELIVERY_RETRY_DELAY_SECONDS]
-    assert "failed to send reminder after 3 attempts" in caplog.text
-
-
-def test_close_cancels_pending_timer_tasks(tmp_path: Path) -> None:
-    async def exercise_close() -> tuple[int, int]:
-        reminders = Reminders(SimpleNamespace(id=202, name="Guild"), tmp_path)
-        reminders.create_timer(make_reminder(), 3_600)
-        task_count_before_close = len(reminders._timer_tasks)  # noqa: SLF001
+def test_unavailable_channel_retries_then_removes(tmp_path: Path, channel: object) -> None:
+    async def exercise() -> None:
+        sleep = ControlledSleep()
+        guild = FakeGuild(channel)
+        reminders = await Reminders.create(
+            guild, tmp_path, _dependencies=_ReminderDependencies(now=lambda: NOW, sleep=sleep)
+        )
+        await reminders.handle(command("5m", "stretch"))
+        for _ in range(3):
+            await sleep.advance()
+        assert guild.lookups == [303, 303, 303]
+        assert sleep.calls == [300, 60, 60]
+        assert persisted(tmp_path)["reminders"] == []
         await reminders.close()
-        return task_count_before_close, len(reminders._timer_tasks)  # noqa: SLF001
 
-    assert run(exercise_close()) == (1, 0)
+    run(exercise())
+
+
+def test_default_sender_preserves_mention_policy(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        sleep = ControlledSleep()
+        channel = RecordingChannel()
+        reminders = await Reminders.create(
+            FakeGuild(channel), tmp_path, _dependencies=_ReminderDependencies(now=lambda: NOW, sleep=sleep)
+        )
+        await reminders.handle(command("5m", "check", "laundry"))
+        await sleep.advance()
+        content, kwargs = channel.sent[0]
+        assert content == "<@1> reminder: check laundry"
+        assert kwargs["allowed_mentions"].to_dict() == {"users": [1], "parse": []}
+        assert persisted(tmp_path)["reminders"] == []
+        await reminders.close()
+
+    run(exercise())
+
+
+def test_close_awaits_cancellation_and_retains_pending_records(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        sleep = ControlledSleep()
+        guild = FakeGuild(RecordingChannel())
+        reminders = await Reminders.create(
+            guild, tmp_path, _dependencies=_ReminderDependencies(now=lambda: NOW, sleep=sleep)
+        )
+        await reminders.handle(command("5m", "stretch"))
+        await reminders.handle(command("1h", "rest"))
+        await asyncio.sleep(0)
+        before = (tmp_path / "202.json").read_bytes()
+        await reminders.close()
+        assert sleep.cancelled == 2
+        assert guild.lookups == []
+        assert (tmp_path / "202.json").read_bytes() == before
+        await reminders.close()
+
+    run(exercise())
+
+
+def test_cancelled_delivery_does_not_remove_or_retry(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        sleep = ControlledSleep()
+        guild = FakeGuild(RecordingChannel())
+
+        async def send(_channel: discord.abc.Messageable, _user_id: int, _content: str) -> None:
+            raise asyncio.CancelledError
+
+        reminders = await Reminders.create(
+            guild, tmp_path, _dependencies=_ReminderDependencies(now=lambda: NOW, sleep=sleep, send_reminder=send)
+        )
+        await reminders.handle(command("5m", "stretch"))
+        before = (tmp_path / "202.json").read_bytes()
+        await sleep.advance()
+        await reminders.close()
+        assert sleep.calls == [300]
+        assert guild.lookups == [303]
+        assert (tmp_path / "202.json").read_bytes() == before
+
+    run(exercise())
+
+
+def test_command_cancellation_propagates(tmp_path: Path) -> None:
+    def cancelled_now() -> datetime:
+        raise asyncio.CancelledError
+
+    async def exercise() -> None:
+        reminders = await Reminders.create(
+            FakeGuild(None), tmp_path, _dependencies=_ReminderDependencies(now=cancelled_now)
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await reminders.handle(command("5m", "stretch"))
+        assert persisted(tmp_path)["reminders"] == []
+        await reminders.close()
+
+    run(exercise())

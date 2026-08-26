@@ -15,12 +15,11 @@ import pytest
 
 from bot_runtime import GENERIC_COMMAND_ERROR, BotRuntime, _RuntimeDependencies
 from bot_state import DATA_DIR_ENV_VAR
+from models import CommandParameters
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
     from pathlib import Path
-
-    from models import CommandParameters
 
 
 def run[T](coro: Coroutine[object, object, T]) -> T:
@@ -65,15 +64,15 @@ class RecordingReminder:
     def __init__(self, *, close_error: Exception | None = None) -> None:
         self.close_error = close_error
         self.closed = False
-        self.create_calls: list[tuple[object, ...]] = []
+        self.parameters: list[CommandParameters] = []
 
     async def close(self) -> None:
         self.closed = True
         if self.close_error is not None:
             raise self.close_error
 
-    async def create_reminder(self, *args: object, **kwargs: object) -> str:
-        self.create_calls.append((*args, kwargs))
+    async def handle(self, parameters: CommandParameters) -> str:
+        self.parameters.append(parameters)
         return "reminder response"
 
 
@@ -506,17 +505,26 @@ def test_tag_command_parameters_preserve_message_context_and_attachment(tmp_path
     assert parameters.fetch_user_func is None
 
 
-def test_reminder_command_routes_to_initialized_guild_handler(tmp_path: Path) -> None:
+@pytest.mark.parametrize("arguments", ["5m drink water", "", "list", "help ignored", "bad duration"])
+def test_reminder_command_routes_to_initialized_guild_handler(tmp_path: Path, arguments: str) -> None:
     guild = make_guild(910)
     runtime, _client, factories = make_runtime(tmp_path, client=FakeClient(guilds=[guild]))
     channel = RecordingChannel()
     run(runtime.on_ready())
 
-    run(runtime.on_message(make_message("$remind 5m drink water", guild=guild, channel=channel)))
+    run(runtime.on_message(make_message(f"$remind {arguments}", guild=guild, channel=channel)))
 
     assert sent_text(channel) == ["reminder response"]
-    assert factories.reminders[guild.id].create_calls == [
-        ("5m", ["drink", "water"], 123, 910, 789, {"user_name": "Alice"})
+    assert factories.reminders[guild.id].parameters == [
+        CommandParameters(
+            command="remind",
+            message=arguments.split(),
+            created_at=datetime(2026, 6, 4, tzinfo=UTC),
+            author_id=123,
+            author_name="Alice",
+            guild_id=910,
+            channel_id=789,
+        )
     ]
 
 
@@ -678,3 +686,57 @@ def test_malformed_guild_registry_file_is_retained_while_other_registry_initiali
     assert bad_file.read_text(encoding="utf-8") == "{bad json"
     other_file = tmp_path / ("reminders" if bad_registry == "tags" else "tags") / f"{guild.id}.json"
     assert other_file.exists()
+
+
+@pytest.mark.parametrize("command", ["remind", "tag"])
+def test_guild_commands_preserve_missing_guild_response(tmp_path: Path, command: str) -> None:
+    runtime, _client, _factories = make_runtime(tmp_path)
+    channel = RecordingChannel()
+    message = make_message(f"${command}", channel=channel)
+    message.guild = None
+    run(runtime.on_message(message))
+    expected = (
+        "guild_id (None) or channel_id 789 is None." if command == "remind" else "unable to get tag. guild_id is None"
+    )
+    assert sent_text(channel) == [expected]
+
+
+def test_missing_reminder_handler_keeps_empty_response(tmp_path: Path) -> None:
+    runtime, _client, _factories = make_runtime(tmp_path)
+    channel = RecordingChannel()
+    run(runtime.on_message(make_message("$remind 5m stretch", channel=channel)))
+    assert sent_text(channel) == [""]
+
+
+def test_guild_removal_discards_both_registries_before_awaiting_shutdown(tmp_path: Path) -> None:
+    async def exercise() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class WaitingReminder(RecordingReminder):
+            async def close(self) -> None:
+                entered.set()
+                await release.wait()
+
+        async def make_reminder(_guild: object, _path: Path) -> WaitingReminder:
+            return WaitingReminder()
+
+        guild = make_guild()
+        factories = RecordingFactories()
+        runtime = BotRuntime(
+            FakeClient(guilds=[guild]),
+            command_delimiter="$",
+            data_dir=tmp_path,
+            _dependencies=_RuntimeDependencies(tag_factory=factories.make_tag, reminder_factory=make_reminder),
+        )
+        await runtime.on_ready()
+        removal = asyncio.create_task(runtime.on_guild_remove(guild))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        channel = RecordingChannel()
+        await runtime.on_message(make_message("$tag launch", channel=channel))
+        await runtime.on_message(make_message("$remind 5m stretch", channel=channel))
+        assert sent_text(channel) == ["unable to get tag. tag function parameter is None", ""]
+        release.set()
+        await removal
+
+    run(exercise())
