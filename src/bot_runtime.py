@@ -25,7 +25,6 @@ from bot_state import (
 from discord_messages import send_command_response
 from models import CommandParameters
 from reminders import Reminders
-from reminders.constants import MIN_REMIND_ARGUMENTS
 from tags import Tags
 
 CommandHandler = Callable[[CommandParameters], Awaitable[str]]
@@ -293,19 +292,7 @@ class BotRuntime:
         reminder_handler = self._reminders.get(guild_id)
         if reminder_handler is None:
             return ""
-        command_message = parameters.message
-        time = command_message[0] if command_message else "help"
-        message = command_message[1:]
-        if len(command_message) < MIN_REMIND_ARGUMENTS:
-            time = "help"
-        return await reminder_handler.create_reminder(
-            time,
-            message,
-            parameters.author_id,
-            guild_id,
-            channel_id,
-            user_name=parameters.author_name,
-        )
+        return await reminder_handler.handle(parameters)
 
     async def _mock(self, parameters: CommandParameters) -> str:
         """Return the command message in alternating case."""
