@@ -18,7 +18,8 @@ To run locally:
 
 ```sh
 uv sync
-SMURFBOT_DISCORD_TOKEN=your_discord_bot_token uv run python src/start.py
+cp .env.example .env # then set SMURFBOT_DISCORD_TOKEN in .env
+uv run --env-file .env python src/start.py
 ```
 
 By default, mutable bot data is stored under `data/`. Set `SMURFBOT_DATA_DIR` to use a different state directory.
@@ -34,13 +35,7 @@ SMURFBOT_REFRESH_GROUP_INTERVAL=600
 SMURFBOT_DISCORD_TOKEN=your_discord_bot_token
 ```
 
-If `SMURFBOT_DISCORD_TOKEN` is not set, the bot reads the Discord token from Vault. Set
-`HASHICORP_VAULT_URL`, `HASHICORP_VAULT_USERNAME`, and `HASHICORP_VAULT_PASSWORD`. The equivalent
-`SMURFBOT_VAULT_URL`, `SMURFBOT_VAULT_USERNAME`, and `SMURFBOT_VAULT_PASSWORD` variables also work.
-The bot logs in through Vault's `userpass` auth method, then uses the returned client token to read the secret.
-If `userpass` is mounted under another name, set `SMURFBOT_VAULT_USERPASS_MOUNT` to that mount path.
-Remote Vault URLs must use HTTPS. Plain HTTP is accepted for literal private-network and loopback IP addresses,
-such as `http://192.168.2.10:8200`, to support local Vault installations.
+Keys and tokens are provided through a `.env` file, which is ignored by git. Copy `.env.example` to `.env` and fill it in. `SMURFBOT_DISCORD_TOKEN` is required; the bot will not start without it.
 
 ## Docker
 
@@ -52,15 +47,7 @@ The Compose service mounts a state directory from the repo:
 
 The container sets `SMURFBOT_DATA_DIR=/home/smurfbot/data`, and the `data/tags` and `data/reminders` directories keep bot data persistent across container restarts.
 
-For Docker Compose, export the hosted Vault URL and userpass credentials, or set `SMURFBOT_DISCORD_TOKEN` directly:
-
-```sh
-export HASHICORP_VAULT_URL=https://vault.example.com
-export HASHICORP_VAULT_USERNAME=smurfbot
-export HASHICORP_VAULT_PASSWORD=your_vault_password
-```
-
-You can also copy `.env.example` to `.env`; Docker Compose automatically reads `.env` for variable interpolation when it is in the same directory as `docker-compose.yml`.
+Docker Compose automatically reads `.env` for variable interpolation when it is in the same directory as `docker-compose.yml`, so the same `.env` file supplies `SMURFBOT_DISCORD_TOKEN` to the container.
 
 You can use the Makefile wrappers:
 
