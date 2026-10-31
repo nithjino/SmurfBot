@@ -1,55 +1,75 @@
 [project]
 name = "smurfbot"
-version = "0.1.0"
-requires-python = ">=3.14"
+version = "0.2.0"
+description = "A small Discord bot for tags and reminders."
+readme = "README.md"
+requires-python = ">=3.15"
 dependencies = [
     "discord.py==2.7.1",
-    "atomicwrites",
-    "pydantic",
+    "pydantic>=2.14,<3",
 ]
 
-[tool.uv]
-package = false
+[project.scripts]
+smurfbot = "smurfbot.__main__:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/smurfbot"]
 
 [dependency-groups]
 dev = [
-    "pyright>=1.1.410",
-    "pytest>=9.0.3",
-    "ruff",
+    "pyright>=1.1.414",
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
 ]
 
 [tool.ruff]
-exclude = [
-    ".git",
-    ".git-rewrite",
-    ".venv",
-    ".vscode",
-    ".idea"
-]
-
 line-length = 120
 indent-width = 4
-target-version = "py314"
+target-version = "py315"
 
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
     "BLE001",
     "COM812",
+    "CPY001",
     "D203",
     "D213",
     "D413",
+    "EM101",
+    "EM102",
     "EXE002",
     "FIX002",
     "PLR0913",
     "TD002",
-    "TD003"
+    "TD003",
+    "TRY003",
 ]
 fixable = ["ALL"]
 unfixable = []
 
-[tool.ruff.lint.mccabe]
-max-complexity = 25
+[tool.ruff.lint.flake8-type-checking]
+runtime-evaluated-base-classes = ["pydantic.BaseModel"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "ANN201",
+    "ANN401",
+    "ASYNC110",
+    "D",
+    "PLR2004",
+    "S101",
+    "S105",
+    "S106",
+    "SLF001",
+    "TC001",
+    "TC002",
+    "TC003",
+]
 
 [tool.ruff.format]
 quote-style = "double"
@@ -59,15 +79,13 @@ line-ending = "auto"
 docstring-code-line-length = "dynamic"
 
 [tool.pyright]
-include = ["src"]
+include = ["src", "tests"]
+strict = ["src"]
 typeCheckingMode = "standard"
-pythonVersion = "3.14"
+pythonVersion = "3.15"
 venv = ".venv"
 venvPath = "."
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
 testpaths = ["tests"]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["ANN201", "D", "PLR2004", "S101"]
+filterwarnings = ["error"]
