@@ -10,8 +10,7 @@ services:
     cpus: "0.5"
     environment:
       SMURFBOT_DELIM: '$' # Single quotes prevent Docker Compose from treating $ as variable interpolation.
-      SMURFBOT_CONSUME_TIME: ".1"
-      SMURFBOT_REFRESH_GROUP_INTERVAL: "600"
+      SMURFBOT_LOG_LEVEL: "INFO"
       SMURFBOT_DISCORD_TOKEN: "${SMURFBOT_DISCORD_TOKEN:-}" # Read from .env.
     volumes:
       - ./data:/home/smurfbot/data

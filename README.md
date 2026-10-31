@@ -5,8 +5,28 @@ SmurfBot is a small Discord bot for a private Discord group.
 ## Libraries used
 
 - [discord.py](https://discordpy.readthedocs.io/en/stable/#)
-- [python-atomicwrites](https://github.com/untitaker/python-atomicwrites)
 - [Pydantic](https://docs.pydantic.dev/)
+
+SmurfBot requires Python 3.15 and [uv](https://docs.astral.sh/uv/). Older uv releases, such as 0.11, can only download a pre-release of 3.15, so update uv if `uv python install 3.15` does not give you a final release.
+
+## Project layout
+
+```text
+src/smurfbot/
+  __main__.py     process entrypoint: settings, logging, signals, shutdown
+  gateway.py      Discord adapter, and the only module that imports discord.py at runtime
+  app.py          composition root that wires the services together
+  router.py       prefix parsing, activation gating, and failure containment
+  activation.py   per-group activation state
+  registry.py     opens one service instance per guild
+  storage.py      atomic JSON files and the data directory lock
+  core.py         transport-neutral types and CommandError
+  commands.py     stateless commands (ping, git, mock, help)
+  tags/           TagBook holds the rules and state; TagCommand parses and words replies
+  reminders/      ReminderBook holds timers and delivery; RemindCommand parses and words replies
+```
+
+Everything except `gateway.py` works with plain Python types, so the bot's behavior can be tested end to end without Discord. `make full-check` runs formatting, linting, type checks, and tests.
 
 ## Instructions
 
@@ -19,10 +39,12 @@ To run locally:
 ```sh
 uv sync
 cp .env.example .env # then set SMURFBOT_DISCORD_TOKEN in .env
-uv run --env-file .env python src/start.py
+uv run --env-file .env smurfbot
 ```
 
-By default, mutable bot data is stored under `data/`. Set `SMURFBOT_DATA_DIR` to use a different state directory.
+By default, mutable bot data is stored under `data/` in the working directory. Set `SMURFBOT_DATA_DIR` to use a different state directory.
+
+Only one bot process can use a data directory at a time. A second process exits with an error instead of overwriting the first one's state.
 
 ## Config and Credentials
 
@@ -30,8 +52,8 @@ The bot loads runtime settings from environment variables:
 
 ```sh
 SMURFBOT_DELIM='$'
-SMURFBOT_CONSUME_TIME=.1
-SMURFBOT_REFRESH_GROUP_INTERVAL=600
+SMURFBOT_DATA_DIR=data
+SMURFBOT_LOG_LEVEL=INFO
 SMURFBOT_DISCORD_TOKEN=your_discord_bot_token
 ```
 
@@ -81,6 +103,8 @@ Every command starts with the delimiter. The default delimiter is `$`.
 | remind | See Reminder Command | `$remind 1h check laundry` |
 | tag | See Tag System | `$tag list` |
 
+The `help` command lists these, and `activate` and `deactivate` turn the bot on and off for a server. Only members with the Administrator or Manage Server permission can use those two in a server. `deactive` still works as an alias for `deactivate`.
+
 ## Reminder Command
 
 | command | argument(s) | example |
@@ -94,11 +118,17 @@ Reminder parameters:
 - `duration`: an integer followed by a unit with no space. Supported units are `s` for seconds, `m` for minutes, `h` for hours, and `d` for days.
 - `message`: the reminder text. Everything after the duration is saved as the reminder message.
 
-The bot rejects reminders longer than `31557600` seconds, which is about one year. Reminders are sent back to the channel where they were created.
+The bot rejects reminders longer than `31557600` seconds, which is about one year. Reminders are sent back to the channel or thread where they were created.
+
+### Reminder delivery
+
+Pending reminders are saved before they are confirmed, so they survive restarts. A reminder that came due while the bot was offline is delivered when the bot returns, with a note saying when it was due.
+
+If sending fails, the bot retries up to 10 times, doubling the wait from 1 minute up to 1 hour, which covers several hours of outage. It gives up immediately only when retrying cannot help, such as when the channel was deleted or the bot lost access. Delivery is at-least-once: a crash at the wrong moment can repeat a reminder, but it will not lose one.
 
 ### Reminder JSON structure
 
-Reminder files are stored as `<data_dir>/reminders/<guild_id>.json`. By default, local runs use `data/reminders/<guild_id>.json`. The bot creates one reminder file per Discord guild and removes expired reminders when it loads or lists them.
+Reminder files are stored as `<data_dir>/reminders/<guild_id>.json`. By default, local runs use `data/reminders/<guild_id>.json`. The bot creates one reminder file per Discord guild and removes each reminder once it has been delivered.
 
 ```json
 {
@@ -155,7 +185,7 @@ $tag create [tag_name]
 
 The `create`, `edit`, `delete`, `gift`, and `rename` commands can only be used by the owner of the tag. The owner is whoever created the tag.
 
-The `owner` command returns the owner user ID and attempts to match it to the owner's Discord username.
+The `owner` command returns the owner's Discord username.
 
 ### Tag JSON structure
 

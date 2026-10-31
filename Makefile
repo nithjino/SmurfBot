@@ -1,8 +1,8 @@
-.PHONY: install-deps format lint type-check full-check build up up-detach up-build up-build-detach down down-rm
+.PHONY: install-deps format lint type-check test full-check run build up up-detach up-build up-build-detach down down-rm
 
 install-deps:
 	@echo "Installing dependencies..."
-	uv venv --python 3.14 --allow-existing
+	uv venv --python 3.15 --allow-existing
 	uv sync
 
 format:
@@ -23,6 +23,10 @@ test:
 
 full-check: format lint type-check test
 	@echo "All checks passed!"
+
+run:
+	@echo "Running smurfbot locally..."
+	uv run --env-file .env smurfbot
 
 build:
 	@echo "Building Docker image..."
