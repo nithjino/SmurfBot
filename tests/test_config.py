@@ -1,63 +1,71 @@
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
-from smurfbot.config import DEFAULT_DATA_DIR, Settings, load_settings
+from smurfbot.config import ConfigError, load_settings
+
+TOKEN = "secret-token-value"
 
 
-def test_loads_prefixed_variables_and_ignores_others() -> None:
+def test_reads_all_four_variables():
     settings = load_settings(
         {
+            "SMURFBOT_DISCORD_TOKEN": TOKEN,
             "SMURFBOT_DELIM": "!",
-            "SMURFBOT_DISCORD_TOKEN": "env-token",
             "SMURFBOT_DATA_DIR": "/srv/smurf",
             "SMURFBOT_LOG_LEVEL": "debug",
-            "OTHER_VALUE": "ignored",
         }
     )
-
-    assert settings == Settings(
-        delim="!",
-        discord_token="env-token",  # pyright: ignore[reportArgumentType]
-        data_dir=Path("/srv/smurf"),
-        log_level="DEBUG",
-    )
+    assert settings.token == TOKEN
+    assert settings.prefix == "!"
+    assert settings.data_dir == Path("/srv/smurf")
+    assert settings.log_level == "DEBUG"
 
 
-def test_defaults() -> None:
-    settings = load_settings({"SMURFBOT_DISCORD_TOKEN": "t"})
-
-    assert settings.delim == "$"
-    assert settings.data_dir == DEFAULT_DATA_DIR
-    assert settings.log_level == "INFO"
+def test_defaults():
+    settings = load_settings({"SMURFBOT_DISCORD_TOKEN": TOKEN})
+    assert (settings.prefix, settings.data_dir, settings.log_level) == ("$", Path("data"), "INFO")
 
 
-def test_retired_variables_from_old_deployments_are_ignored() -> None:
+def test_empty_values_fall_back_to_defaults():
     settings = load_settings(
-        {"SMURFBOT_DISCORD_TOKEN": "t", "SMURFBOT_CONSUME_TIME": ".1", "SMURFBOT_REFRESH_GROUP_INTERVAL": "600"}
+        {
+            "SMURFBOT_DISCORD_TOKEN": TOKEN,
+            "SMURFBOT_DELIM": "",
+            "SMURFBOT_DATA_DIR": "",
+            "SMURFBOT_LOG_LEVEL": "",
+        }
     )
-
-    assert settings.discord_token.get_secret_value() == "t"
-
-
-def test_empty_data_dir_means_default() -> None:
-    assert load_settings({"SMURFBOT_DISCORD_TOKEN": "t", "SMURFBOT_DATA_DIR": ""}).data_dir == DEFAULT_DATA_DIR
+    assert (settings.prefix, settings.data_dir, settings.log_level) == ("$", Path("data"), "INFO")
 
 
-def test_data_dir_expands_home() -> None:
-    assert load_settings({"SMURFBOT_DISCORD_TOKEN": "t", "SMURFBOT_DATA_DIR": "~/x"}).data_dir == Path.home() / "x"
+def test_a_space_prefix_is_kept():
+    assert load_settings({"SMURFBOT_DISCORD_TOKEN": TOKEN, "SMURFBOT_DELIM": " "}).prefix == " "
 
 
-@pytest.mark.parametrize(
-    ("environment", "field"),
-    [
-        ({}, "discord_token"),
-        ({"SMURFBOT_DISCORD_TOKEN": ""}, "discord_token"),
-        ({"SMURFBOT_DISCORD_TOKEN": "t", "SMURFBOT_DELIM": ""}, "delim"),
-        ({"SMURFBOT_DISCORD_TOKEN": "t", "SMURFBOT_LOG_LEVEL": "LOUD"}, "log_level"),
-    ],
-)
-def test_invalid_settings_are_rejected(environment: dict[str, str], field: str) -> None:
-    with pytest.raises(ValidationError, match=field):
-        load_settings(environment)
+def test_data_dir_expands_home():
+    settings = load_settings({"SMURFBOT_DISCORD_TOKEN": TOKEN, "SMURFBOT_DATA_DIR": "~/smurf"})
+    assert settings.data_dir == Path.home() / "smurf"
+
+
+def test_unknown_variables_are_ignored():
+    settings = load_settings({"SMURFBOT_DISCORD_TOKEN": TOKEN, "SMURFBOT_COLOR": "blue", "HOME": "/x"})
+    assert settings.prefix == "$"
+
+
+@pytest.mark.parametrize("token", [None, ""])
+def test_missing_token_raises(token: str | None):
+    environ = {"SMURFBOT_LOG_LEVEL": "INFO"} | ({} if token is None else {"SMURFBOT_DISCORD_TOKEN": token})
+    with pytest.raises(ConfigError, match="SMURFBOT_DISCORD_TOKEN"):
+        load_settings(environ)
+
+
+def test_invalid_log_level_raises_without_the_value():
+    with pytest.raises(ConfigError, match="SMURFBOT_LOG_LEVEL") as info:
+        load_settings({"SMURFBOT_DISCORD_TOKEN": TOKEN, "SMURFBOT_LOG_LEVEL": "loud-and-proud"})
+    assert "loud-and-proud" not in str(info.value).lower()
+    assert TOKEN not in str(info.value)
+
+
+def test_repr_hides_the_token():
+    assert TOKEN not in repr(load_settings({"SMURFBOT_DISCORD_TOKEN": TOKEN}))

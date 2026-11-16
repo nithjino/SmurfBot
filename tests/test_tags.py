@@ -1,378 +1,207 @@
-import asyncio
-import json
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-from smurfbot import storage
-from smurfbot.core import CommandError, GroupRef
-from smurfbot.registry import GuildRegistry
-from smurfbot.storage import StateFileError
-from smurfbot.tags import TagBook, TagCommand, UserLookupError
-from smurfbot.tags.book import MAX_TAGS_PER_GUILD, RESERVED_NAMES
-from smurfbot.tags.commands import HELP_TEXT
-from smurfbot.text import DISCORD_MESSAGE_LIMIT, TRUNCATION_SUFFIX
-from tests.support import GUILD, context, read_json, run
+from smurfbot.store import Store, Tag
+from smurfbot.tags import HELP_TEXT, MAX_TAGS_PER_GUILD, RESERVED_NAMES, parse_user, tag_command
+from tests.helpers import AUTHOR, GUILD, make_dm, make_request
 
-GUILD_FILE = f"{GUILD.id}.json"
+OTHER = 2
 
 
-async def fetch_alice(_user_id: int) -> str:
-    return "Alice"
+def tag(store: Store, text: str, **overrides: Any) -> str:
+    return tag_command(store, make_request(**overrides), text.split())
 
 
-def make(directory: Path, fetch_user_name: Any = fetch_alice) -> TagCommand:
-    async def open_book(guild: GroupRef) -> TagBook:
-        return await TagBook.open(directory, guild)
-
-    return TagCommand(GuildRegistry(open_book), fetch_user_name)
-
-
-async def tag(command: TagCommand, *args: str, author_id: int = 7, attachment_url: str | None = None) -> str:
-    """Run a command the way the router would, showing refusals as replies."""
-    try:
-        return await command(context(*args, author_id=author_id, attachment_url=attachment_url))
-    except CommandError as error:
-        return error.message
+@pytest.fixture
+def seeded(store: Store) -> Store:
+    store.state.tags[GUILD] = {"cool": Tag(owner=AUTHOR, content="a cool tag"), "other": Tag(owner=OTHER, content="x")}
+    store.save()
+    return store
 
 
-def saved(directory: Path) -> dict[str, Any]:
-    return read_json(directory / GUILD_FILE)
+@pytest.mark.parametrize("text", ["", "help", "help me"])
+def test_help(store: Store, text: str):
+    assert tag(store, text) == HELP_TEXT
 
 
-def test_first_use_creates_the_exact_file_and_restarts_keep_tags(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        assert await tag(tags, "create", "launch", "go", "now") == 'The tag "launch" was created successfully'
-        assert saved(tmp_path) == {
-            "name": "Guild",
-            "id": 202,
-            "tags": {"launch": {"owner": 7, "content": "go now"}},
-        }
-        assert await tag(make(tmp_path), "launch") == "go now"
-
-    run(exercise())
-
-
-def test_listing_an_unused_guild_creates_an_empty_file(tmp_path: Path) -> None:
-    run(tag(make(tmp_path), "list"))
-
-    assert saved(tmp_path) == {"name": "Guild", "id": 202, "tags": {}}
-
-
-def test_help_and_case_sensitive_lookup(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        assert await tag(tags) == HELP_TEXT
-        assert await tag(tags, "help", "ignored") == HELP_TEXT
-        assert await tag(tags, "missing") == 'The tag "missing" does not exist'
-        await tag(tags, "create", "Launch", "go now")
-        assert await tag(tags, "Launch", "ignored") == "go now"
-        assert await tag(tags, "launch") == 'The tag "launch" does not exist'
-        assert await tag(tags, "CREATE", "unused") == 'The tag "CREATE" does not exist'
-
-    run(exercise())
+def test_help_text_wording():
+    assert HELP_TEXT == (
+        'To create a tag: "tag create [name]" while uploading a picture or by providing a link or text after the name. '
+        'To post an already created tag: "tag [name]". To see what tags are made: "tag list". To edit a tag: '
+        '"tag edit [name] [new material]". To rename a tag: "tag rename [current name] [new name]".'
+    )
 
 
 @pytest.mark.parametrize(
-    ("args", "expected"),
+    ("text", "reply"),
     [
-        (("create",), "Usage: tag create [name] [content]"),
-        (("delete",), "Usage: tag delete [name]"),
-        (("edit",), "Usage: tag edit [name] [new material]"),
-        (("edit", "launch"), "Usage: tag edit [name] [new material]"),
-        (("rename",), "Usage: tag rename [current name] [new name]"),
-        (("rename", "launch"), "Usage: tag rename [current name] [new name]"),
-        (("gift",), "Usage: tag gift [name] [new owner mention or id]"),
-        (("gift", "launch"), "Usage: tag gift [name] [new owner mention or id]"),
-        (("owner",), "Usage: tag owner [name]"),
-        (("filter",), "Usage: tag filter [keyword]"),
+        ("create", "Usage: tag create [name] [content]"),
+        ("edit", "Usage: tag edit [name] [new material]"),
+        ("edit cool", "Usage: tag edit [name] [new material]"),
+        ("delete", "Usage: tag delete [name]"),
+        ("rename", "Usage: tag rename [current name] [new name]"),
+        ("rename cool", "Usage: tag rename [current name] [new name]"),
+        ("gift", "Usage: tag gift [name] [new owner mention or id]"),
+        ("gift cool", "Usage: tag gift [name] [new owner mention or id]"),
+        ("owner", "Usage: tag owner [name]"),
+        ("filter", "Usage: tag filter [keyword]"),
     ],
 )
-def test_usage_messages(tmp_path: Path, args: tuple[str, ...], expected: str) -> None:
-    assert run(tag(make(tmp_path), *args)) == expected
+def test_usage(seeded: Store, text: str, reply: str):
+    assert tag(seeded, text) == reply
 
 
-def test_attachments_win_over_text_and_empty_tags_are_refused(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        url = "https://example.test/d.png"
-        assert await tag(tags, "create", "diagram", "ignored", attachment_url=url) == (
-            'The tag "diagram" was created successfully'
-        )
-        assert await tag(tags, "diagram") == url
-        empty = "A tag needs either text content or an attachment"
-        assert await tag(tags, "create", "empty") == empty
-        assert await tag(tags, "create", "empty", "ignored", attachment_url="") == empty
-        assert await tag(tags, "create", "diagram", "again") == 'The tag "diagram" already exists'
-        assert saved(tmp_path)["tags"] == {"diagram": {"owner": 7, "content": url}}
+def test_show(seeded: Store):
+    assert tag(seeded, "cool") == "a cool tag"
+    assert tag(seeded, "cool and more words") == "a cool tag"
+    assert tag(seeded, "missing") == 'The tag "missing" does not exist'
 
-    run(exercise())
+
+def test_names_and_subcommands_are_case_sensitive(seeded: Store):
+    assert tag(seeded, "COOL") == 'The tag "COOL" does not exist'
+    assert tag(seeded, "CREATE x y") == 'The tag "CREATE" does not exist'
+    assert tag(seeded, "create Cool text") == 'The tag "Cool" was created successfully'
+    assert tag(seeded, "Cool") == "text"
+
+
+def test_create(seeded: Store):
+    assert tag(seeded, "create new some  words here") == 'The tag "new" was created successfully'
+    assert seeded.state.tags[GUILD]["new"] == Tag(owner=AUTHOR, content="some words here")
+    assert list(seeded.state.tags[GUILD]) == ["cool", "other", "new"]
+
+
+def test_create_refusals(seeded: Store):
+    assert tag(seeded, "create cool again") == 'The tag "cool" already exists'
+    assert tag(seeded, "create empty") == "A tag needs either text content or an attachment"
+    assert tag(seeded, "create empty", attachment_url="") == "A tag needs either text content or an attachment"
+    assert "empty" not in seeded.state.tags[GUILD]
 
 
 @pytest.mark.parametrize("name", sorted(RESERVED_NAMES))
-def test_reserved_names_are_refused(tmp_path: Path, name: str) -> None:
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        await tag(tags, "create", "launch", "go now")
-        before = (tmp_path / GUILD_FILE).read_bytes()
-        expected = f'The tag name "{name}" is reserved for a tag command'
-        assert await tag(tags, "create", name, "shadowed") == expected
-        assert await tag(tags, "rename", "launch", name) == expected
-        assert (tmp_path / GUILD_FILE).read_bytes() == before
-
-    run(exercise())
+def test_reserved_names_are_refused(seeded: Store, name: str):
+    assert tag(seeded, f"create {name} text") == f'The tag name "{name}" is reserved for a tag command'
+    assert tag(seeded, f"rename cool {name}") == f'The tag name "{name}" is reserved for a tag command'
+    assert set(seeded.state.tags[GUILD]) == {"cool", "other"}
 
 
-def test_every_subcommand_is_reserved(tmp_path: Path) -> None:
-    assert set(make(tmp_path)._subcommands) == RESERVED_NAMES
+def test_reserved_names_are_exactly_the_subcommands():
+    assert {"create", "delete", "edit", "filter", "gift", "help", "list", "owner", "rename"} == RESERVED_NAMES
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    [("edit", "launch", "blocked"), ("rename", "launch", "mission"), ("delete", "launch"), ("gift", "launch", "9")],
-)
-def test_only_the_owner_can_change_a_tag(tmp_path: Path, mutation: tuple[str, ...]) -> None:
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        await tag(tags, "create", "launch", "go now")
-        before = (tmp_path / GUILD_FILE).read_bytes()
-        assert await tag(tags, *mutation, author_id=8) == 'You are not the owner of the tag "launch"'
-        assert (tmp_path / GUILD_FILE).read_bytes() == before
-
-    run(exercise())
+def test_attachment_wins_over_text(seeded: Store):
+    url = "https://cdn.example/pic.png"
+    assert tag(seeded, "create pic ignored", attachment_url=url) == 'The tag "pic" was created successfully'
+    assert seeded.state.tags[GUILD]["pic"].content == url
+    assert tag(seeded, "edit cool ignored", attachment_url=url) == 'The tag "cool" has been edited'
+    assert tag(seeded, "edit pic", attachment_url=url + "?2") == 'The tag "pic" has been edited'
+    assert seeded.state.tags[GUILD]["cool"].content == url
+    assert seeded.state.tags[GUILD]["pic"].content == url + "?2"
 
 
-def test_mutations_persist_exact_records(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        await tag(tags, "create", "launch", "go now")
-        await tag(tags, "create", "taken", "already here")
-        assert await tag(tags, "edit", "launch", "updated", "content") == 'The tag "launch" has been edited'
-        assert saved(tmp_path)["tags"]["launch"] == {"owner": 7, "content": "updated content"}
-        assert await tag(tags, "rename", "launch", "taken") == 'The tag "taken" already exists'
-        assert await tag(tags, "rename", "launch", "mission", "ignored") == (
-            'The tag "launch" has been renamed to "mission"'
-        )
-        assert saved(tmp_path)["tags"] == {
-            "taken": {"owner": 7, "content": "already here"},
-            "mission": {"owner": 7, "content": "updated content"},
-        }
-        assert await tag(tags, "gift", "mission", "9", "ignored") == 'The tag "mission" has been gifted to 9'
-        assert saved(tmp_path)["tags"]["mission"] == {"owner": 9, "content": "updated content"}
-        assert await tag(tags, "edit", "mission", "blocked") == 'You are not the owner of the tag "mission"'
-        assert await tag(tags, "delete", "mission", "ignored", author_id=9) == 'The tag "mission" has been deleted'
-        assert saved(tmp_path)["tags"] == {"taken": {"owner": 7, "content": "already here"}}
-
-    run(exercise())
+def test_limit(store: Store):
+    store.state.tags[GUILD] = {f"t{i}": Tag(owner=AUTHOR, content="c") for i in range(MAX_TAGS_PER_GUILD - 1)}
+    assert MAX_TAGS_PER_GUILD == 500
+    assert tag(store, "create last c") == 'The tag "last" was created successfully'
+    assert tag(store, "create over c") == "Tag limit reached. Delete a tag before creating a new one. Limit: 500"
+    assert tag(store, "create t1 c") == 'The tag "t1" already exists'
+    assert len(store.state.tags[GUILD]) == 500
+    assert tag(store, "create over c", guild_id=GUILD + 1) == 'The tag "over" was created successfully'
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    [("edit", "missing", "value"), ("rename", "missing", "new"), ("delete", "missing"), ("gift", "missing", "9")],
-)
-def test_empty_and_missing_tag_responses(tmp_path: Path, mutation: tuple[str, ...]) -> None:
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        assert await tag(tags, *mutation) == "There are no tags"
-        await tag(tags, "create", "present", "value")
-        assert await tag(tags, *mutation) == 'The tag "missing" does not exist'
-
-    run(exercise())
+def test_edit(seeded: Store):
+    assert tag(seeded, "edit cool new  text") == 'The tag "cool" has been edited'
+    assert tag(seeded, "cool") == "new text"
+    assert tag(seeded, "edit missing x") == 'The tag "missing" does not exist'
 
 
-@pytest.mark.parametrize("new_owner", ["42", "<@42>", "<@!42>"])
-def test_gift_accepts_ids_and_mentions(tmp_path: Path, new_owner: str) -> None:
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        await tag(tags, "create", "launch", "go now")
-        assert await tag(tags, "gift", "launch", new_owner) == 'The tag "launch" has been gifted to 42'
-        assert saved(tmp_path)["tags"]["launch"] == {"owner": 42, "content": "go now"}
-
-    run(exercise())
+def test_delete(seeded: Store):
+    assert tag(seeded, "delete cool") == 'The tag "cool" has been deleted'
+    assert "cool" not in seeded.state.tags[GUILD]
+    assert tag(seeded, "delete cool") == 'The tag "cool" does not exist'
 
 
-@pytest.mark.parametrize("new_owner", ["alice", "<@alice>", "<@&42>", "-1"])
-def test_gift_rejects_invalid_recipients(tmp_path: Path, new_owner: str) -> None:
-    expected = "The new owner must be a Discord user mention or user id"
-
-    assert run(tag(make(tmp_path), "gift", "missing", new_owner)) == expected
-
-
-def test_list_and_filter(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        assert await tag(tags, "list") == "No tags exist"
-        assert await tag(tags, "filter", "launch") == "No tags contain the word launch"
-        for name in ["z-launch", "Launch", "a-launch"]:
-            await tag(tags, "create", name, "go now")
-        assert await tag(tags, "list", "ignored") == "z-launch, Launch, a-launch"
-        assert await tag(tags, "filter", "launch", "ignored") == "z-launch, a-launch"
-        assert await tag(tags, "filter", "Launch") == "Launch"
-        await tag(tags, "rename", "z-launch", "renamed")
-        assert await tag(tags, "list") == "Launch, a-launch, renamed"
-        assert await tag(make(tmp_path), "list") == "Launch, a-launch, renamed"
-
-    run(exercise())
+def test_rename(seeded: Store):
+    assert tag(seeded, "rename cool cooler") == 'The tag "cool" has been renamed to "cooler"'
+    assert tag(seeded, "cooler") == "a cool tag"
+    assert tag(seeded, "cool") == 'The tag "cool" does not exist'
+    assert tag(seeded, "rename missing x") == 'The tag "missing" does not exist'
+    seeded.state.tags[GUILD]["mine"] = Tag(owner=AUTHOR, content="m")
+    assert tag(seeded, "rename cooler mine") == 'The tag "mine" already exists'
+    assert tag(seeded, "rename cooler cooler") == 'The tag "cooler" already exists'
 
 
-def test_content_is_truncated_and_the_guild_limit_holds(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        await tag(tags, "create", "long", "a" * (DISCORD_MESSAGE_LIMIT + 50))
-        expected = "a" * (DISCORD_MESSAGE_LIMIT - len(TRUNCATION_SUFFIX)) + TRUNCATION_SUFFIX
-        assert await tag(tags, "long") == expected
-        assert saved(tmp_path)["tags"]["long"]["content"] == expected
-        await tag(tags, "edit", "long", "b" * (DISCORD_MESSAGE_LIMIT + 50))
-        assert len(saved(tmp_path)["tags"]["long"]["content"]) == DISCORD_MESSAGE_LIMIT
-        for index in range(MAX_TAGS_PER_GUILD - 1):
-            await tag(tags, "create", f"tag-{index:03}", "go now")
-        before = (tmp_path / GUILD_FILE).read_bytes()
-        assert await tag(tags, "create", "overflow", "value") == (
-            "Tag limit reached. Delete a tag before creating a new one. Limit: 200"
-        )
-        assert (tmp_path / GUILD_FILE).read_bytes() == before
-
-    run(exercise())
+def test_gift(seeded: Store):
+    assert tag(seeded, "gift cool <@42>") == 'The tag "cool" has been gifted to <@42>'
+    assert seeded.state.tags[GUILD]["cool"].owner == 42
+    assert tag(seeded, "gift cool 7") == 'You are not the owner of the tag "cool"'
+    assert tag(seeded, "edit cool new", author_id=42) == 'The tag "cool" has been edited'
+    assert tag(seeded, "gift missing 42") == 'The tag "missing" does not exist'
+    assert tag(seeded, "gift missing alice") == "The new owner must be a Discord user mention or user id"
 
 
-def test_owner_lookup(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        fetched: list[int] = []
-
-        async def fetch(user_id: int) -> str:
-            fetched.append(user_id)
-            return "Alice"
-
-        tags = make(tmp_path, fetch)
-        assert await tag(tags, "owner", "missing") == 'The tag "missing" does not exist'
-        assert fetched == []
-        await tag(tags, "create", "launch", "go now")
-        assert await tag(tags, "owner", "launch") == 'The owner of "launch" is Alice'
-        assert fetched == [7]
-
-    run(exercise())
+@pytest.mark.parametrize(("text", "user_id"), [("42", 42), ("<@42>", 42), ("<@!42>", 42)])
+def test_parse_user_accepts(text: str, user_id: int):
+    assert parse_user(text) == user_id
 
 
-def test_failed_owner_lookup_is_reported(tmp_path: Path) -> None:
-    async def fetch(_user_id: int) -> str:
-        raise UserLookupError
-
-    async def exercise() -> None:
-        tags = make(tmp_path, fetch)
-        await tag(tags, "create", "launch", "go now")
-        assert await tag(tags, "owner", "launch") == 'Ran into an error when trying to get the owner of "launch"'
-
-    run(exercise())
+@pytest.mark.parametrize("text", ["alice", "<@alice>", "<@&42>", "-1", "<@42", "42>", "", "\uff14\uff12"])
+def test_parse_user_rejects(seeded: Store, text: str):
+    assert parse_user(text) is None
+    if text:
+        assert tag(seeded, f"gift cool {text}") == "The new owner must be a Discord user mention or user id"
 
 
-@pytest.mark.parametrize("error", [asyncio.CancelledError, RuntimeError])
-def test_unexpected_lookup_errors_propagate(tmp_path: Path, error: type[BaseException]) -> None:
-    async def fetch(_user_id: int) -> str:
-        raise error
-
-    async def exercise() -> None:
-        tags = make(tmp_path, fetch)
-        await tag(tags, "create", "launch", "go now")
-        with pytest.raises(error):
-            await tag(tags, "owner", "launch")
-
-    run(exercise())
+@pytest.mark.parametrize("text", ["edit other x", "delete other", "rename other x", "gift other 1"])
+def test_only_the_owner_can_change_a_tag(seeded: Store, text: str):
+    before = seeded.path.read_bytes()
+    assert tag(seeded, text) == 'You are not the owner of the tag "other"'
+    assert seeded.path.read_bytes() == before
+    assert seeded.state.tags[GUILD]["other"] == Tag(owner=OTHER, content="x")
 
 
-def test_owner_lookup_does_not_block_mutations(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        entered = asyncio.Event()
-        release = asyncio.Event()
-
-        async def fetch(_user_id: int) -> str:
-            entered.set()
-            await release.wait()
-            return "Alice"
-
-        tags = make(tmp_path, fetch)
-        await tag(tags, "create", "launch", "go now")
-        lookup = asyncio.create_task(tag(tags, "owner", "launch"))
-        await asyncio.wait_for(entered.wait(), timeout=1)
-        assert await asyncio.wait_for(tag(tags, "gift", "launch", "9"), timeout=1) == (
-            'The tag "launch" has been gifted to 9'
-        )
-        release.set()
-        assert await lookup == 'The owner of "launch" is Alice'
-        assert saved(tmp_path)["tags"]["launch"]["owner"] == 9
-
-    run(exercise())
+def test_owner(seeded: Store):
+    assert tag(seeded, "owner other") == 'The owner of "other" is <@2>'
+    assert tag(seeded, "owner missing") == 'The tag "missing" does not exist'
 
 
-def test_concurrent_mutations_keep_all_records(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        created = await asyncio.gather(*(tag(tags, "create", f"tag-{i}", "original") for i in range(20)))
-        assert created == [f'The tag "tag-{i}" was created successfully' for i in range(20)]
-        await asyncio.gather(*(tag(tags, "edit", f"tag-{i}", "updated") for i in range(20)))
-        assert saved(tmp_path)["tags"] == {f"tag-{i}": {"owner": 7, "content": "updated"} for i in range(20)}
-        results = await asyncio.gather(*(tag(tags, "create", "shared", "value") for _ in range(2)))
-        assert results == ['The tag "shared" was created successfully', 'The tag "shared" already exists']
+def test_list(seeded: Store):
+    seeded.state.tags[GUILD]["alpha"] = Tag(owner=AUTHOR, content="a")
+    assert tag(seeded, "list") == "cool, other, alpha"
+    assert tag(seeded, "list", guild_id=GUILD + 1) == "No tags exist"
+    assert GUILD + 1 not in seeded.state.tags
 
-    run(exercise())
+
+def test_filter(seeded: Store):
+    seeded.state.tags[GUILD]["Cooler"] = Tag(owner=AUTHOR, content="a")
+    assert tag(seeded, "filter oo") == "cool, Cooler"
+    assert tag(seeded, "filter Coo") == "Cooler"
+    assert tag(seeded, "filter zzz") == "No tags contain the word zzz"
+
+
+def test_tags_are_separate_per_guild(seeded: Store):
+    assert tag(seeded, "cool", guild_id=GUILD + 1) == 'The tag "cool" does not exist'
+    assert tag(seeded, "create cool b", guild_id=GUILD + 1) == 'The tag "cool" was created successfully'
+    assert tag(seeded, "cool") == "a cool tag"
+    assert tag(seeded, "cool", guild_id=GUILD + 1) == "b"
+
+
+def test_tags_survive_a_reload(seeded: Store):
+    tag(seeded, "create new text")
+    tag(seeded, "gift cool 42")
+    reloaded = Store(seeded.path)
+    assert reloaded.state.tags == seeded.state.tags
+    assert tag(reloaded, "new") == "text"
+
+
+@pytest.mark.parametrize("text", ["", "help"])
+def test_help_works_in_a_dm(store: Store, text: str):
+    assert tag_command(store, make_dm(), text.split()) == HELP_TEXT
 
 
 @pytest.mark.parametrize(
-    "source",
-    ["{bad json", '{"id":202,"name":"Guild","tags":{"broken":{}}}', '{"id":202,"name":"G","tags":{},"extra":1}'],
+    "text", ["cool", "create x y", "edit x y", "delete x", "rename x y", "gift x 1", "owner x", "list", "filter x"]
 )
-def test_corrupt_files_are_refused_and_stay_untouched(tmp_path: Path, source: str) -> None:
-    path = tmp_path / GUILD_FILE
-    path.write_text(source, encoding="utf-8")
-
-    with pytest.raises(StateFileError):
-        run(tag(make(tmp_path), "list"))
-
-    assert path.read_text(encoding="utf-8") == source
-
-
-def test_string_ids_from_older_files_load_and_normalize_on_write(tmp_path: Path) -> None:
-    source = {"name": "Old Guild", "id": "202", "tags": {"launch": {"owner": "7", "content": "go now"}}}
-    path = tmp_path / GUILD_FILE
-    path.write_text(json.dumps(source), encoding="utf-8")
-
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        assert await tag(tags, "launch") == "go now"
-        assert saved(tmp_path) == source
-        assert await tag(tags, "edit", "launch", "updated") == 'The tag "launch" has been edited'
-
-    run(exercise())
-
-    assert saved(tmp_path) == {"name": "Old Guild", "id": 202, "tags": {"launch": {"owner": 7, "content": "updated"}}}
-
-
-def test_failed_save_does_not_change_what_chat_sees(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def fail(_path: Path, _text: str) -> None:
-        raise OSError("disk full")
-
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        await tag(tags, "create", "launch", "go now")
-        monkeypatch.setattr(storage, "write_atomic", fail)
-        with pytest.raises(OSError, match="disk full"):
-            await tag(tags, "create", "new", "value")
-        with pytest.raises(OSError, match="disk full"):
-            await tag(tags, "edit", "launch", "changed")
-        with pytest.raises(OSError, match="disk full"):
-            await tag(tags, "delete", "launch")
-        assert await tag(tags, "list") == "launch"
-        assert await tag(tags, "launch") == "go now"
-
-    run(exercise())
-
-
-def test_tags_need_a_guild_but_help_does_not(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        tags = make(tmp_path)
-        assert await tags(context(guild=None)) == HELP_TEXT
-        with pytest.raises(CommandError, match="only work in a server"):
-            await tags(context("list", guild=None))
-
-    run(exercise())
+def test_everything_else_is_refused_in_a_dm(store: Store, text: str):
+    assert tag_command(store, make_dm(), text.split()) == "Tags only work in a server."
+    assert not store.path.exists()

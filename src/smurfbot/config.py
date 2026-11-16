@@ -1,47 +1,44 @@
-"""Runtime settings loaded from SMURFBOT_* environment variables."""
+"""Settings read from environment variables."""
 
-import os
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final, Literal
-lazy from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
-ENV_PREFIX: Final = "SMURFBOT_"
-DEFAULT_DATA_DIR: Final = Path("data")
-
-type LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
-class Settings(BaseModel):
-    """Everything the bot needs to know before connecting to Discord."""
-
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    discord_token: SecretStr = Field(min_length=1)
-    delim: str = Field(default="$", min_length=1)
-    data_dir: Path = DEFAULT_DATA_DIR
-    log_level: LogLevel = "INFO"
-
-    @field_validator("data_dir", mode="before")
-    @classmethod
-    def _expand_data_dir(cls, value: str | Path) -> Path:
-        """Treat an empty value as unset, since Compose passes empty variables through."""
-        return Path(value).expanduser() if value else DEFAULT_DATA_DIR
-
-    @field_validator("log_level", mode="before")
-    @classmethod
-    def _normalize_log_level(cls, value: str) -> str:
-        return value.upper()
+class ConfigError(Exception):
+    """A required setting is missing or invalid."""
 
 
-def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
-    """Build settings from SMURFBOT_* variables, ignoring unrelated ones."""
-    environment = os.environ if environ is None else environ
-    return Settings.model_validate(
-        {
-            key.removeprefix(ENV_PREFIX).lower(): value
-            for key, value in environment.items()
-            if key.startswith(ENV_PREFIX)
-        }
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Settings:
+    """Runtime settings for the bot."""
+
+    token: str = field(repr=False)
+    prefix: str
+    data_dir: Path
+    log_level: str
+
+
+def load_settings(environ: Mapping[str, str]) -> Settings:
+    """Build settings from the environment, treating empty values as unset."""
+
+    def get(name: str, default: str) -> str:
+        return environ.get(name) or default
+
+    token = get("SMURFBOT_DISCORD_TOKEN", "")
+    if not token:
+        raise ConfigError("SMURFBOT_DISCORD_TOKEN is required")
+    log_level = get("SMURFBOT_LOG_LEVEL", "INFO").upper()
+    if log_level not in LOG_LEVELS:
+        raise ConfigError("SMURFBOT_LOG_LEVEL must be one of DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+    return Settings(
+        token=token,
+        prefix=get("SMURFBOT_DELIM", "$"),
+        data_dir=Path(get("SMURFBOT_DATA_DIR", "data")).expanduser(),
+        log_level=log_level,
     )

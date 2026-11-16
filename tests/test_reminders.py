@@ -2,478 +2,244 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-from smurfbot import storage
-from smurfbot.core import CommandError, GroupRef
-from smurfbot.registry import GuildRegistry
-from smurfbot.reminders import Clock, PermanentDeliveryError, RemindCommand, ReminderBook, ReminderSender
-from smurfbot.reminders.book import (
-    BASE_RETRY_SECONDS,
-    MAX_DELIVERY_ATTEMPTS,
+from smurfbot.reminders import (
+    HELP_TEXT,
     MAX_REMINDERS_PER_GUILD,
-    MAX_RETRY_SECONDS,
-    MAX_SLEEP_SECONDS,
-    retry_delay,
+    InvalidDelayError,
+    PermanentDeliveryError,
+    deliver_due,
+    parse_delay,
+    remind_command,
+    render,
 )
-from smurfbot.reminders.commands import HELP_TEXT, MAX_REMINDER_SECONDS, parse_delay
-from smurfbot.storage import StateFileError
-from smurfbot.text import DISCORD_MESSAGE_LIMIT, TRUNCATION_SUFFIX
-from tests.support import GUILD, NOW, FakeClock, RecordingSender, context, read_json, run, until
+from smurfbot.store import Reminder, Store
+from tests.helpers import AUTHOR, CHANNEL, GUILD, NOW, make_dm, make_request
 
-GUILD_FILE = f"{GUILD.id}.json"
-
-
-def record(*, execution_time: str = "2026-06-04T12:05:00") -> dict[str, object]:
-    return {
-        "user_id": 1,
-        "name": "Alice",
-        "message": "check laundry",
-        "created_at": "2026-06-04T12:00:00",
-        "execution_time": execution_time,
-        "timezone": "utc",
-        "guild_id": 202,
-        "channel_id": 303,
-    }
+BAD_UNIT = "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"
+TOO_FAR = "Why are you using this feature for a reminder that far in the future?"
+PAST = "Why are you trying to set a reminder for the past?"
+NOW_TS = int(NOW.timestamp())
 
 
-def seed(directory: Path, *reminders: dict[str, object]) -> None:
-    path = directory / GUILD_FILE
-    path.write_text(json.dumps({"name": "Guild", "id": 202, "reminders": list(reminders)}), encoding="utf-8")
+def remind(store: Store, text: str, **overrides: Any) -> str:
+    return remind_command(store, make_request(**overrides), text.split(), NOW)
 
 
-def pending(directory: Path) -> list[dict[str, Any]]:
-    return read_json(directory / GUILD_FILE)["reminders"]
+def reminder(message: str = "m", due: datetime = NOW, **overrides: int) -> Reminder:
+    fields = {"guild_id": GUILD, "channel_id": CHANNEL, "user_id": AUTHOR} | overrides
+    return Reminder(message=message, due=due, **fields)
 
 
-async def remind(command: RemindCommand, *args: str, author_name: str = "Alice") -> str:
-    """Run a command the way the router would, showing refusals as replies."""
-    try:
-        return await command(context(*args, author_id=1, author_name=author_name))
-    except CommandError as error:
-        return error.message
+class Sender:
+    def __init__(self, *errors: BaseException | None) -> None:
+        self.sent: list[tuple[Reminder, str]] = []
+        self.errors = list(errors)
+
+    async def __call__(self, item: Reminder, text: str) -> None:
+        error = self.errors.pop(0) if self.errors else None
+        if error is not None:
+            raise error
+        self.sent.append((item, text))
 
 
-class Harness:
-    def __init__(self, directory: Path, send: ReminderSender | None = None, clock: FakeClock | None = None) -> None:
-        self.directory = directory
-        self.send = send or RecordingSender()
-        self.fake = clock or FakeClock()
-        self.registry = GuildRegistry(self._open, closer=ReminderBook.close)
-        self.command = RemindCommand(self.registry)
-
-    async def _open(self, guild: GroupRef) -> ReminderBook:
-        return await ReminderBook.open(self.directory, guild, self.send, self.fake.clock)
-
-    async def open(self) -> ReminderBook:
-        return await self.registry.get(GUILD)
-
-    async def close(self) -> None:
-        await self.registry.close()
-
-
-def test_first_use_creates_the_exact_file(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        harness = Harness(tmp_path)
-        await harness.open()
-        assert read_json(tmp_path / GUILD_FILE) == {"name": "Guild", "id": 202, "reminders": []}
-        await harness.close()
-
-    run(exercise())
-
-
-@pytest.mark.parametrize("args", [(), ("help",), ("5m",), ("help", "ignored")])
-def test_help(tmp_path: Path, args: tuple[str, ...]) -> None:
-    async def exercise() -> None:
-        harness = Harness(tmp_path)
-        assert await remind(harness.command, *args) == HELP_TEXT
-        await harness.close()
-
-    run(exercise())
+def deliver(store: Store, send: Sender, now: datetime = NOW) -> bool:
+    return asyncio.run(deliver_due(store, send, now))
 
 
 @pytest.mark.parametrize(
-    ("duration", "response"),
+    ("text", "seconds"), [("30s", 30), ("2M", 120), ("3h", 10800), ("4d", 345600), ("365d", 31536000)]
+)
+def test_parse_delay(text: str, seconds: int):
+    assert parse_delay(text) == seconds
+
+
+@pytest.mark.parametrize(
+    ("text", "reply"),
     [
-        ("2w", "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"),
-        ("soon", "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"),
-        ("xs", "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"),
-        ("s", "Unsupported unit of time. Please use s (seconds), m (minutes), h (hours), or d (days)"),
-        (f"{MAX_REMINDER_SECONDS + 1}s", "Why are you using this feature for a reminder that far in the future?"),
-        ("0s", "Why are you trying to set a reminder for the past?"),
-        ("-1h", "Why are you trying to set a reminder for the past?"),
+        ("2w", BAD_UNIT),
+        ("soon", BAD_UNIT),
+        ("xs", BAD_UNIT),
+        ("s", BAD_UNIT),
+        ("1.5h", BAD_UNIT),
+        ("31557601s", TOO_FAR),
+        ("366d", TOO_FAR),
+        ("0s", PAST),
+        ("-1h", PAST),
     ],
 )
-def test_invalid_durations_do_not_write_or_schedule(tmp_path: Path, duration: str, response: str) -> None:
-    async def exercise() -> None:
-        harness = Harness(tmp_path)
-        await harness.open()
-        before = (tmp_path / GUILD_FILE).stat()
-        assert await remind(harness.command, duration, "stretch") == response
-        assert (tmp_path / GUILD_FILE).stat() == before
-        await asyncio.sleep(0)
-        assert harness.fake.sleeps == []
-        await harness.close()
-
-    run(exercise())
+def test_parse_delay_failures(text: str, reply: str):
+    with pytest.raises(InvalidDelayError) as info:
+        parse_delay(text)
+    assert str(info.value) == reply
 
 
-@pytest.mark.parametrize(("duration", "seconds"), [("30s", 30), ("2M", 120), ("3h", 10800), ("4d", 345600)])
-def test_supported_durations(duration: str, seconds: int) -> None:
-    assert parse_delay(duration) == seconds
+def test_parse_delay_limit_is_inclusive():
+    assert parse_delay("31557600s") == 31557600
 
 
-@pytest.mark.parametrize("author_name", ["Alice", ""])
-def test_create_persists_first_and_formats_dates(tmp_path: Path, author_name: str) -> None:
-    async def exercise() -> None:
-        snapshots: list[list[dict[str, Any]]] = []
-        fake = FakeClock()
-
-        async def observing_sleep(seconds: float) -> None:
-            snapshots.append(pending(tmp_path))
-            await original_sleep(seconds)
-
-        original_sleep = fake.clock.sleep
-        fake.clock = Clock(now=fake.clock.now, sleep=observing_sleep)
-        harness = Harness(tmp_path, clock=fake)
-        name = author_name or "1"
-        assert await remind(harness.command, "5m", "check", "laundry", author_name=author_name) == (
-            f"Created reminder for {name} to go off at 06/04/2026 @ 08:05AM that says `check laundry`"
-        )
-        expected = [{**record(), "name": name}]
-        assert pending(tmp_path) == expected
-        await asyncio.sleep(0)
-        assert snapshots == [expected]
-        assert fake.sleeps == [300]
-        assert await remind(harness.command, "list", "ignored") == (
-            f"\nCreated by: {name}\nReminder date: 06/04/2026 @ 08:05AM\nReminder message: check laundry\n"
-        )
-        await harness.close()
-
-    run(exercise())
+def test_render():
+    assert render(NOW) == f"<t:{NOW_TS}:f>"
 
 
-def test_bare_list_lists_instead_of_showing_help(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        harness = Harness(tmp_path)
-        assert await remind(harness.command, "list") == "No active reminders were found"
-        await remind(harness.command, "5m", "stretch")
-        assert "Reminder message: stretch" in await remind(harness.command, "list")
-        await harness.close()
-
-    run(exercise())
+@pytest.mark.parametrize("text", ["", "help", "1h", "help me now"])
+def test_help(store: Store, text: str):
+    assert remind(store, text) == HELP_TEXT
+    assert remind_command(store, make_dm(), text.split(), NOW) == HELP_TEXT
 
 
-def test_delivery_sends_then_removes(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        send = RecordingSender()
-        harness = Harness(tmp_path, send)
-        await remind(harness.command, "5m", "check", "laundry")
-        await until(lambda: harness.fake.waiting == 1)
-        await harness.fake.advance(299)
-        await until(lambda: harness.fake.waiting == 1)
-        assert send.attempts == []
-        await harness.fake.advance(1)
-        await until(lambda: pending(tmp_path) == [])
-        assert [content for _, content in send.attempts] == ["<@1> reminder: check laundry"]
-        await harness.close()
-
-    run(exercise())
+def test_help_text_wording():
+    assert HELP_TEXT == (
+        "Format: $remind [amount of time] [message]. Example: $remind 1h check laundry\n"
+        "Support units: s (seconds), m (minutes), h (hours), or d (days)."
+    )
 
 
-def test_reminders_due_while_offline_are_delivered_late_not_dropped(tmp_path: Path) -> None:
-    seed(tmp_path, record(execution_time="2026-06-04T11:00:00"))
-
-    async def exercise() -> None:
-        send = RecordingSender()
-        harness = Harness(tmp_path, send)
-        await harness.open()
-        await until(lambda: pending(tmp_path) == [])
-        assert [content for _, content in send.attempts] == [
-            "<@1> reminder (was due 06/04/2026 @ 07:00AM): check laundry"
-        ]
-        await harness.close()
-
-    run(exercise())
+def test_list_empty(store: Store):
+    assert remind(store, "list") == "No active reminders were found"
 
 
-def test_future_reminders_resume_with_the_remaining_delay(tmp_path: Path) -> None:
-    seed(tmp_path, record())
-
-    async def exercise() -> None:
-        harness = Harness(tmp_path)
-        await harness.open()
-        await until(lambda: harness.fake.sleeps == [300])
-        assert pending(tmp_path) == [record()]
-        await harness.close()
-
-    run(exercise())
-
-
-def test_list_shows_overdue_reminders_still_being_retried(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        send = RecordingSender(failures=1)
-        harness = Harness(tmp_path, send)
-        await remind(harness.command, "5m", "stretch")
-        await until(lambda: harness.fake.waiting == 1)
-        await harness.fake.advance(300)
-        await until(lambda: len(send.attempts) == 1 and harness.fake.waiting == 1)
-        assert "Reminder message: stretch" in await remind(harness.command, "list")
-        assert len(pending(tmp_path)) == 1
-        await harness.close()
-
-    run(exercise())
+def test_list_shows_this_guilds_reminders_in_order(store: Store):
+    store.state.reminders = [
+        reminder("first", NOW + timedelta(hours=1), user_id=7),
+        reminder("elsewhere", guild_id=GUILD + 1),
+        reminder("second", NOW),
+    ]
+    later = NOW_TS + 3600
+    assert remind(store, "list") == (
+        f"\nCreated by: <@7>\nReminder date: <t:{later}:f>\nReminder message: first\n"
+        f"\nCreated by: <@1>\nReminder date: <t:{NOW_TS}:f>\nReminder message: second\n"
+    )
 
 
-def test_long_waits_recheck_the_wall_clock(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        send = RecordingSender()
-        harness = Harness(tmp_path, send)
-        await remind(harness.command, "2h", "stretch")
-        await until(lambda: harness.fake.sleeps == [MAX_SLEEP_SECONDS])
-        harness.fake.current += timedelta(hours=1, minutes=59)
-        await harness.fake.advance(MAX_SLEEP_SECONDS)
-        await until(lambda: pending(tmp_path) == [])
-        assert len(send.attempts) == 1
-        await harness.close()
-
-    run(exercise())
+def test_create_persists_the_exact_record_and_reply(store: Store):
+    reply = remind(store, "10m check  the oven", channel_id=999)
+    due = NOW + timedelta(minutes=10)
+    assert reply == f"Created reminder for <@1> to go off at <t:{NOW_TS + 600}:f> that says `check the oven`"
+    expected = Reminder(guild_id=GUILD, channel_id=999, user_id=AUTHOR, message="check the oven", due=due)
+    assert store.state.reminders == [expected]
+    assert Store(store.path).state.reminders == [expected]
+    assert json.loads(store.path.read_text())["reminders"][0]["due"] == "2026-06-03T14:26:47Z"
 
 
-@pytest.mark.parametrize(
-    "error",
-    [ConnectionError("network"), TimeoutError(), RuntimeError("anything else")],
-    ids=["network", "timeout", "unexpected"],
-)
-def test_any_failure_is_retried_until_delivered(tmp_path: Path, error: Exception) -> None:
-    """A dropped connection used to kill the timer, stranding the reminder until a restart."""
-
-    async def exercise() -> None:
-        send = RecordingSender(failures=2, error=error)
-        harness = Harness(tmp_path, send)
-        await remind(harness.command, "5m", "stretch")
-        await until(lambda: harness.fake.waiting == 1)
-        await harness.fake.advance(300)
-        for attempt in (1, 2):
-            await until(lambda: len(send.attempts) == attempt and harness.fake.waiting == 1)  # noqa: B023
-            assert len(pending(tmp_path)) == 1
-            await harness.fake.advance(retry_delay(attempt))
-        await until(lambda: pending(tmp_path) == [])
-        assert len(send.attempts) == 3
-        assert harness.fake.sleeps == [300, 60, 120]
-        await harness.close()
-
-    run(exercise())
+@pytest.mark.parametrize("text", ["list", "1h check", "bad check"])
+def test_dm_refusals(store: Store, text: str):
+    assert remind_command(store, make_dm(), text.split(), NOW) == "Reminders only work in a server."
+    assert not store.path.exists()
 
 
-def test_retry_delay_doubles_up_to_the_ceiling() -> None:
-    assert retry_delay(1) == BASE_RETRY_SECONDS
-    assert retry_delay(2) == BASE_RETRY_SECONDS * 2
-    assert retry_delay(MAX_DELIVERY_ATTEMPTS) == MAX_RETRY_SECONDS
+def test_limit(store: Store):
+    store.state.reminders = [reminder() for _ in range(MAX_REMINDERS_PER_GUILD - 1)]
+    assert MAX_REMINDERS_PER_GUILD == 100
+    assert remind(store, "1h last").startswith("Created reminder")
+    before = store.path.read_bytes()
+    assert remind(store, "1h over") == (
+        "Reminder limit reached. Wait for a reminder to complete before creating a new one. Limit: 100"
+    )
+    assert store.path.read_bytes() == before
+    assert len(store.state.reminders) == 100
+    assert remind(store, "1h other", guild_id=GUILD + 1).startswith("Created reminder")
 
 
-def test_gives_up_after_the_last_attempt(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    async def exercise() -> None:
-        send = RecordingSender(failures=MAX_DELIVERY_ATTEMPTS)
-        harness = Harness(tmp_path, send)
-        await remind(harness.command, "5m", "stretch")
-        await until(lambda: harness.fake.waiting == 1)
-        await harness.fake.advance(300)
-        for attempt in range(1, MAX_DELIVERY_ATTEMPTS):
-            await until(lambda: len(send.attempts) == attempt and harness.fake.waiting == 1)  # noqa: B023
-            await harness.fake.advance(retry_delay(attempt))
-        await until(lambda: pending(tmp_path) == [])
-        assert len(send.attempts) == MAX_DELIVERY_ATTEMPTS
-        await harness.close()
-
-    with caplog.at_level(logging.ERROR):
-        run(exercise())
-
-    assert f"after {MAX_DELIVERY_ATTEMPTS} attempts" in caplog.text
+@pytest.mark.parametrize(("text", "reply"), [("2w x", BAD_UNIT), ("400d x", TOO_FAR), ("0s x", PAST)])
+def test_refused_create_writes_nothing(store: Store, text: str, reply: str):
+    assert remind(store, text) == reply
+    assert store.state.reminders == []
+    assert not store.path.exists()
 
 
-def test_permanent_failures_are_not_retried(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        send = RecordingSender(failures=1, error=PermanentDeliveryError("channel deleted"))
-        harness = Harness(tmp_path, send)
-        await remind(harness.command, "5m", "stretch")
-        await until(lambda: harness.fake.waiting == 1)
-        await harness.fake.advance(300)
-        await until(lambda: pending(tmp_path) == [])
-        assert len(send.attempts) == 1
-        assert harness.fake.sleeps == [300]
-        await harness.close()
-
-    run(exercise())
+def test_nothing_due_sends_nothing(store: Store):
+    store.state.reminders = [reminder(due=NOW + timedelta(seconds=1))]
+    send = Sender()
+    assert deliver(store, send) is True
+    assert send.sent == []
+    assert len(store.state.reminders) == 1
 
 
-def test_duplicate_reminders_each_deliver_once(tmp_path: Path) -> None:
-    seed(tmp_path, record(), record())
-
-    async def exercise() -> None:
-        send = RecordingSender()
-        harness = Harness(tmp_path, send)
-        await harness.open()
-        await until(lambda: harness.fake.waiting == 2)
-        await harness.fake.advance(300)
-        await until(lambda: pending(tmp_path) == [])
-        assert len(send.attempts) == 2
-        await harness.close()
-
-    run(exercise())
+def test_due_reminder_is_sent_then_removed_from_the_file(store: Store):
+    store.state.reminders = [reminder("check the oven"), reminder("later", NOW + timedelta(hours=1))]
+    store.save()
+    send = Sender()
+    assert deliver(store, send) is True
+    assert send.sent == [(reminder("check the oven"), "<@1> reminder: check the oven")]
+    assert [r.message for r in Store(store.path).state.reminders] == ["later"]
 
 
-def test_close_cancels_timers_and_keeps_pending_reminders(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        send = RecordingSender()
-        harness = Harness(tmp_path, send)
-        await remind(harness.command, "5m", "stretch")
-        await remind(harness.command, "1h", "rest")
-        await until(lambda: harness.fake.waiting == 2)
-        before = (tmp_path / GUILD_FILE).read_bytes()
-        await harness.close()
-        assert send.attempts == []
-        assert (tmp_path / GUILD_FILE).read_bytes() == before
-        await harness.close()
-
-    run(exercise())
+@pytest.mark.parametrize(("late", "noted"), [(59, False), (60, True), (3600, True)])
+def test_late_note(store: Store, late: int, *, noted: bool):
+    store.state.reminders = [reminder("x", NOW - timedelta(seconds=late))]
+    send = Sender()
+    deliver(store, send)
+    due_ts = NOW_TS - late
+    expected = f"<@1> reminder (was due <t:{due_ts}:f>): x" if noted else "<@1> reminder: x"
+    assert send.sent[0][1] == expected
 
 
-def test_cancelled_send_keeps_the_reminder_for_the_next_start(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        started = asyncio.Event()
-
-        async def send(_reminder: object, _content: str) -> None:
-            started.set()
-            await asyncio.Event().wait()
-
-        harness = Harness(tmp_path, send)
-        await remind(harness.command, "5m", "stretch")
-        await until(lambda: harness.fake.waiting == 1)
-        await harness.fake.advance(300)
-        await asyncio.wait_for(started.wait(), timeout=1)
-        await harness.close()
-        assert len(pending(tmp_path)) == 1
-
-    run(exercise())
+def test_identical_reminders_each_deliver_once(store: Store):
+    store.state.reminders = [reminder("same"), reminder("same")]
+    send = Sender()
+    assert deliver(store, send) is True
+    assert len(send.sent) == 2
+    assert store.state.reminders == []
+    assert deliver(store, send) is True
+    assert len(send.sent) == 2
 
 
-def test_failed_removal_is_logged_and_only_risks_a_duplicate(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    def fail(_path: Path, _text: str) -> None:
+def test_transient_error_keeps_the_reminder_for_the_next_pass(store: Store, caplog: pytest.LogCaptureFixture):
+    store.state.reminders = [reminder("a"), reminder("b")]
+    send = Sender(RuntimeError("503"), None)
+    assert deliver(store, send) is False
+    assert [r.message for r in store.state.reminders] == ["a"]
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+    assert deliver(store, send) is True
+    assert [item.message for item, _ in send.sent] == ["b", "a"]
+    assert store.state.reminders == []
+
+
+def test_permanent_error_drops_the_reminder(store: Store):
+    store.state.reminders = [reminder("gone")]
+    store.save()
+    send = Sender(PermanentDeliveryError("404"))
+    assert deliver(store, send) is True
+    assert store.state.reminders == []
+    assert Store(store.path).state.reminders == []
+    assert deliver(store, send) is True
+    assert send.sent == []
+
+
+def test_cancellation_during_a_send_keeps_the_reminder(store: Store):
+    store.state.reminders = [reminder("stay")]
+    send = Sender(asyncio.CancelledError())
+    with pytest.raises(asyncio.CancelledError):
+        deliver(store, send)
+    assert [r.message for r in store.state.reminders] == ["stay"]
+
+
+def test_failed_save_after_a_send_still_removes_it_from_memory(
+    store: Store, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    store.state.reminders = [reminder("once")]
+
+    def fail() -> None:
         raise OSError("disk full")
 
-    async def exercise() -> None:
-        harness = Harness(tmp_path)
-        book = await harness.open()
-        await remind(harness.command, "5m", "stretch")
-        await until(lambda: harness.fake.waiting == 1)
-        monkeypatch.setattr(storage, "write_atomic", fail)
-        await harness.fake.advance(300)
-        await until(lambda: "could not persist reminder removal" in caplog.text)
-        assert book.pending == ()
-        assert len(pending(tmp_path)) == 1
-        await harness.close()
-
-    run(exercise())
+    monkeypatch.setattr(store, "save", fail)
+    send = Sender()
+    assert deliver(store, send) is True
+    assert store.state.reminders == []
+    assert "Could not save state after delivering a reminder" in caplog.messages
+    deliver(store, send)
+    assert len(send.sent) == 1
 
 
-def test_failed_save_does_not_schedule(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    def fail(_path: Path, _text: str) -> None:
-        raise OSError("disk full")
-
-    async def exercise() -> None:
-        harness = Harness(tmp_path)
-        book = await harness.open()
-        monkeypatch.setattr(storage, "write_atomic", fail)
-        with pytest.raises(OSError, match="disk full"):
-            await remind(harness.command, "5m", "stretch")
-        await asyncio.sleep(0)
-        assert book.pending == ()
-        assert harness.fake.sleeps == []
-        await harness.close()
-
-    run(exercise())
-
-
-def test_truncation_and_guild_limit(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        harness = Harness(tmp_path)
-        await remind(harness.command, "5m", "a" * (DISCORD_MESSAGE_LIMIT + 50))
-        saved = pending(tmp_path)[0]["message"]
-        assert len(saved) == DISCORD_MESSAGE_LIMIT
-        assert saved.endswith(TRUNCATION_SUFFIX)
-        for _ in range(MAX_REMINDERS_PER_GUILD - 1):
-            await remind(harness.command, "5m", "stretch")
-        before = (tmp_path / GUILD_FILE).read_bytes()
-        assert await remind(harness.command, "5m", "stretch") == (
-            "Reminder limit reached. Delete or wait for a reminder to complete before creating a new one. Limit: 100"
-        )
-        assert (tmp_path / GUILD_FILE).read_bytes() == before
-        await harness.close()
-
-    run(exercise())
-
-
-def test_delivered_text_fits_a_discord_message(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        send = RecordingSender()
-        harness = Harness(tmp_path, send)
-        await remind(harness.command, "5m", "a" * DISCORD_MESSAGE_LIMIT)
-        await until(lambda: harness.fake.waiting == 1)
-        await harness.fake.advance(300)
-        await until(lambda: pending(tmp_path) == [])
-        assert len(send.attempts[0][1]) == DISCORD_MESSAGE_LIMIT
-        await harness.close()
-
-    run(exercise())
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "{bad json",
-        '{"id": 202, "name": "Guild", "reminders": [{}]}',
-        json.dumps({"id": 202, "name": "Guild", "reminders": [record(execution_time="tomorrow")]}),
-    ],
-)
-def test_corrupt_files_are_refused_and_stay_untouched(tmp_path: Path, source: str) -> None:
-    path = tmp_path / GUILD_FILE
-    path.write_text(source, encoding="utf-8")
-
-    async def exercise() -> None:
-        harness = Harness(tmp_path)
-        with pytest.raises(StateFileError):
-            await harness.open()
-
-    run(exercise())
-
-    assert path.read_text(encoding="utf-8") == source
-
-
-def test_saved_timestamps_are_utc_whatever_the_clock_zone(tmp_path: Path) -> None:
-    eastern_noon = datetime(2026, 6, 4, 8, tzinfo=NOW.tzinfo) + timedelta(hours=4)
-    assert eastern_noon.astimezone(UTC) == NOW
-
-    async def exercise() -> None:
-        harness = Harness(tmp_path, clock=FakeClock(eastern_noon))
-        await remind(harness.command, "5m", "stretch")
-        assert pending(tmp_path)[0]["created_at"] == "2026-06-04T12:00:00"
-        await harness.close()
-
-    run(exercise())
-
-
-def test_reminders_need_a_guild(tmp_path: Path) -> None:
-    async def exercise() -> None:
-        harness = Harness(tmp_path)
-        assert await harness.command(context(guild=None)) == HELP_TEXT
-        for args in (("list",), ("5m", "stretch")):
-            with pytest.raises(CommandError, match="only work in a server"):
-                await harness.command(context(*args, guild=None))
-
-    run(exercise())
+def test_overdue_reminders_from_an_existing_file_deliver_on_the_first_pass(store: Store):
+    store.state.reminders = [reminder("old", datetime(2026, 1, 1, tzinfo=UTC))]
+    store.save()
+    reloaded = Store(store.path)
+    send = Sender()
+    assert deliver(reloaded, send) is True
+    assert send.sent[0][1] == f"<@1> reminder (was due <t:{int(datetime(2026, 1, 1, tzinfo=UTC).timestamp())}:f>): old"
+    assert Store(store.path).state.reminders == []
