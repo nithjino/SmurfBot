@@ -13,20 +13,18 @@ SmurfBot requires Python 3.15 and [uv](https://docs.astral.sh/uv/). Older uv rel
 
 ```text
 src/smurfbot/
-  __main__.py     process entrypoint: settings, logging, signals, shutdown
-  gateway.py      Discord adapter, and the only module that imports discord.py at runtime
-  app.py          composition root that wires the services together
-  router.py       prefix parsing, activation gating, and failure containment
-  activation.py   per-group activation state
-  registry.py     opens one service instance per guild
-  storage.py      atomic JSON files and the data directory lock
-  core.py         transport-neutral types and CommandError
-  commands.py     stateless commands (ping, git, mock, help)
-  tags/           TagBook holds the rules and state; TagCommand parses and words replies
-  reminders/      ReminderBook holds timers and delivery; RemindCommand parses and words replies
+  __main__.py    process entrypoint: settings, logging, data directory lock, state, client
+  config.py      settings read from environment variables
+  core.py        the Request type every command receives
+  store.py       state models, loading and atomic saving of state.json, the data directory lock
+  commands.py    prefix parsing, activation, and the stateless commands (ping, git, help, mock)
+  tags.py        the tag command
+  reminders.py   the remind command and reminder delivery
+  bot.py         the Discord client: message translation, replies, and the reminder loop
+  migrate.py     one-off importer for the 0.2 data files
 ```
 
-Everything except `gateway.py` works with plain Python types, so the bot's behavior can be tested end to end without Discord. `make full-check` runs formatting, linting, type checks, and tests.
+All state lives in one file, `<data_dir>/state.json`, which is loaded once at startup and rewritten after every change. Command handling is plain synchronous Python, and only `bot.py` and `__main__.py` use discord.py, so the commands are tested without Discord. `make full-check` runs formatting, linting, type checks, and tests.
 
 ## Instructions
 
@@ -67,7 +65,7 @@ The Compose service mounts a state directory from the repo:
 ./data -> /home/smurfbot/data
 ```
 
-The container sets `SMURFBOT_DATA_DIR=/home/smurfbot/data`, and the `data/tags` and `data/reminders` directories keep bot data persistent across container restarts.
+The container sets `SMURFBOT_DATA_DIR=/home/smurfbot/data`, so `data/state.json` keeps bot data persistent across container restarts.
 
 Docker Compose automatically reads `.env` for variable interpolation when it is in the same directory as `docker-compose.yml`, so the same `.env` file supplies `SMURFBOT_DISCORD_TOKEN` to the container.
 
@@ -103,7 +101,7 @@ Every command starts with the delimiter. The default delimiter is `$`.
 | remind | See Reminder Command | `$remind 1h check laundry` |
 | tag | See Tag System | `$tag list` |
 
-The `help` command lists these, and `activate` and `deactivate` turn the bot on and off for a server. Only members with the Administrator or Manage Server permission can use those two in a server. `deactive` still works as an alias for `deactivate`.
+The `help` command lists these, and `activate` and `deactivate` turn the bot on and off for a server or a DM. A deactivated server ignores every command except `activate`. Only members with the Administrator or Manage Server permission can use those two in a server. `deactive` still works as an alias for `deactivate`.
 
 ## Reminder Command
 
@@ -120,30 +118,27 @@ Reminder parameters:
 
 The bot rejects reminders longer than `31557600` seconds, which is about one year. Reminders are sent back to the channel or thread where they were created.
 
+Reminder times are shown as Discord timestamps, so each reader sees them in their own timezone. Users are shown as mentions that do not ping anyone, except for the reminder itself, which pings the person who set it. A server can have up to 100 pending reminders.
+
 ### Reminder delivery
 
-Pending reminders are saved before they are confirmed, so they survive restarts. A reminder that came due while the bot was offline is delivered when the bot returns, with a note saying when it was due.
+Pending reminders are saved before they are confirmed, so they survive restarts. The bot checks for due reminders about once a second. A reminder that came due while the bot was offline is delivered when the bot returns, with a note saying when it was due.
 
-If sending fails, the bot retries up to 10 times, doubling the wait from 1 minute up to 1 hour, which covers several hours of outage. It gives up immediately only when retrying cannot help, such as when the channel was deleted or the bot lost access. Delivery is at-least-once: a crash at the wrong moment can repeat a reminder, but it will not lose one.
+If sending fails, the bot retries every minute until the reminder is sent. It gives up immediately only when retrying cannot help, such as when the channel was deleted or the bot lost access. Delivery is at-least-once: a crash at the wrong moment can repeat a reminder, but it will not lose one.
 
 ### Reminder JSON structure
 
-Reminder files are stored as `<data_dir>/reminders/<guild_id>.json`. By default, local runs use `data/reminders/<guild_id>.json`. The bot creates one reminder file per Discord guild and removes each reminder once it has been delivered.
+Reminders are stored in the `reminders` list of `<data_dir>/state.json`. Each one is removed once it has been delivered.
 
 ```json
 {
-  "id": 224644073795878913,
-  "name": "guild name",
   "reminders": [
     {
+      "guild_id": 728428225268547616,
+      "channel_id": 728428225268547619,
       "user_id": 112784387862450176,
-      "name": "username",
       "message": "check the oven",
-      "created_at": "2026-06-03T14:16:47",
-      "execution_time": "2026-06-03T14:26:47",
-      "timezone": "utc",
-      "guild_id": 224644073795878913,
-      "channel_id": 224644073795878913
+      "due": "2026-06-03T14:26:47Z"
     }
   ]
 }
@@ -151,17 +146,11 @@ Reminder files are stored as `<data_dir>/reminders/<guild_id>.json`. By default,
 
 Field notes:
 
-- top-level `id`: Discord guild ID for this reminder file.
-- top-level `name`: Discord guild name.
-- `reminders`: active reminders for the guild.
+- `guild_id`: Discord guild ID the reminder was created in.
+- `channel_id`: Discord channel or thread ID where the reminder is sent.
 - `user_id`: Discord user ID to mention when the reminder fires.
-- reminder item `name`: Discord username captured when the reminder was created.
 - `message`: reminder text.
-- `created_at`: UTC creation time formatted as `YYYY-MM-DDTHH:MM:SS`.
-- `execution_time`: UTC time when the reminder should fire, formatted as `YYYY-MM-DDTHH:MM:SS`.
-- `timezone`: currently saved as `utc`.
-- `guild_id`: Discord guild ID stored on the reminder record.
-- `channel_id`: Discord channel ID where the reminder should be sent.
+- `due`: UTC time when the reminder should fire.
 
 ## Tag System
 
@@ -173,7 +162,8 @@ Field notes:
 | none | `[tag_name]` | `$tag cooltag` |
 | list | none | `$tag list` |
 | owner | `[tag_name]` | `$tag owner cooltag` |
-| gift | `[tag_name] @mention` | `$tag gift cooltag @new_owner` |
+| filter | `[keyword]` | `$tag filter cool` |
+| gift | `[tag_name] @mention or user id` | `$tag gift cooltag @new_owner` |
 | rename | `[tag_name] [new_tag_name]` | `$tag rename cooltag coolertag` |
 | help | none | `$tag help` |
 
@@ -183,27 +173,36 @@ Field notes:
 $tag create [tag_name]
 ```
 
-The `create`, `edit`, `delete`, `gift`, and `rename` commands can only be used by the owner of the tag. The owner is whoever created the tag.
+An uploaded image also works with `edit`, and it takes the place of any text after the name.
 
-The `owner` command returns the owner's Discord username.
+The owner of a tag is whoever created it, or whoever it was gifted to. Only the owner can use `edit`, `delete`, `gift`, and `rename` on it. Tag names are case-sensitive, and each server can have up to 500 tags.
+
+The `owner` command shows the owner as a mention that does not ping them. Long replies, such as `tag list` in a big server, are split across several messages.
 
 ### Tag JSON structure
 
-Tag files are stored as `<data_dir>/tags/<guild_id>.json`. By default, local runs use `data/tags/<guild_id>.json`.
+Tags are stored in the `tags` map of `<data_dir>/state.json`, keyed by guild ID and then by tag name. Tags are listed in the order they were created.
 
 ```json
 {
-  "id": "guild id goes here",
-  "name": "guild name goes here",
   "tags": {
-    "tag1": {
-      "content": "tag1 content",
-      "owner": "owner id"
-    },
-    "tag2": {
-      "content": "tag2 content",
-      "owner": "owner id"
+    "728428225268547616": {
+      "cooltag": { "owner": 112784387862450176, "content": "this is a cool tag" }
     }
   }
 }
 ```
+
+The other top-level key, `deactivated`, lists the IDs of servers and DM channels where the bot is turned off.
+
+If `state.json` is not valid, the bot refuses to start and leaves the file as it is.
+
+## Migrating from 0.2
+
+Version 0.2 stored data in `groups.json`, `tags/<guild_id>.json`, and `reminders/<guild_id>.json`. Version 0.3 reads only `state.json`. Stop the bot, then convert the old files once:
+
+```sh
+uv run python -m smurfbot.migrate data
+```
+
+The importer writes `data/state.json` and logs how many deactivated groups, tags, and reminders it imported. It refuses to run if `state.json` already exists, and it never changes or deletes the old files, so you can remove them yourself once the bot is running on the new file. Files such as `groups_dev.json` are ignored.

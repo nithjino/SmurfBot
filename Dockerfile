@@ -18,5 +18,5 @@ RUN apk add --no-cache tzdata \
 COPY --from=build /opt/smurfbot/.venv /opt/smurfbot/.venv
 USER smurfbot
 WORKDIR /home/smurfbot
-RUN mkdir -p data/tags data/reminders
+RUN mkdir -p data
 CMD ["smurfbot"]
